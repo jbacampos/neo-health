@@ -6,7 +6,11 @@ import sqlite3
 import subprocess
 import gzip
 import sys
+import argparse
+import json
 from datetime import datetime
+
+DB_PATH = "/opt/neo-health/health.db"
 
 # ============================================================
 # Neo Health Check
@@ -15,8 +19,34 @@ from datetime import datetime
 
 def run_command(command):
     """Executa um comando do sistema e devolve sua saída."""
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
     return result.stdout.strip()
+
+
+def run_command_or_none(command):
+    """Executa comando não essencial; devolve None quando a ferramenta falha."""
+    try:
+        return run_command(command)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def get_systemd_unit_state(unit):
+    """True/False quando o systemd responde; None quando não foi consultável."""
+    try:
+        result = subprocess.run(["systemctl", "is-active", "--quiet", unit])
+    except OSError:
+        return None
+    return result.returncode == 0
+
+
+def get_collection_status_value(missing_components):
+    """'partial' apenas com falha de coleta; 'unsupported' não é falha."""
+    return (
+        "partial"
+        if any(item.get("status") == "failed" for item in missing_components.values())
+        else "ok"
+    )
 
 
 def section(title):
@@ -93,6 +123,61 @@ def get_disk(path):
     }
 
 
+def get_collection_status(health):
+    """Marca como parcial apenas falhas de consulta, não achados de saúde."""
+    missing = health["missing_components"]
+    required = (
+        ("load", health["system"].get("load")),
+        ("memory", health["system"].get("memory")),
+        ("filesystem_root", health["disks"].get("/")),
+    )
+    for component, value in required:
+        if value is None:
+            missing[component] = {"status": "failed", "reason": "medição indisponível"}
+    health["collection_status"] = get_collection_status_value(missing)
+
+
+def validate_essential_collection(health):
+    """Interrompe a coleta se faltar load, memória do host ou filesystem /."""
+    load = health["system"].get("load")
+    memory = health["system"].get("memory") or {}
+    root = health["disks"].get("/")
+    if not load or len(load) != 3 or any(value is None for value in load):
+        raise RuntimeError("falha essencial: load 1/5/15 indisponível")
+    if memory.get("used_mb") is None or memory.get("percent") is None:
+        raise RuntimeError("falha essencial: memória do host indisponível")
+    if root is None or root.get("percent") is None or root.get("free") is None:
+        raise RuntimeError("falha essencial: filesystem / indisponível")
+
+
+def initialize_health_schema(conn):
+    """Adiciona os metadados de validade sem afetar bancos existentes."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS health (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            load_1m REAL, load_5m REAL, load_15m REAL,
+            memory_used_mb INTEGER, memory_percent REAL,
+            cpu_temp REAL, nvme_temp REAL,
+            root_used_percent REAL, root_free_bytes INTEGER,
+            updates_available INTEGER,
+            tb_memory_mb REAL, pg_memory_mb REAL,
+            tb_database_mb REAL, pg_volume_mb REAL
+        )"""
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(health)")}
+    if "pg_volume_mb" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN pg_volume_mb REAL")
+        columns.add("pg_volume_mb")
+    if "collection_status" not in columns:
+        conn.execute(
+            "ALTER TABLE health ADD COLUMN collection_status "
+            "TEXT NOT NULL DEFAULT 'ok'"
+        )
+    if "missing_components" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN missing_components TEXT")
+
+
 def format_disk_free(kb):
     """Formata espaço livre de forma amigável."""
     if kb >= 1024 * 1024:
@@ -116,7 +201,10 @@ def format_memory_value(value):
 
 def get_temperatures():
     """Obtém temperaturas relevantes através do lm-sensors."""
-    result = subprocess.run(["sensors"], capture_output=True, text=True)
+    try:
+        result = subprocess.run(["sensors"], capture_output=True, text=True)
+    except OSError:
+        return {}
 
     if result.returncode != 0:
         return {}
@@ -154,19 +242,25 @@ def get_temperatures():
 
 def get_container_info(container):
     """Obtém estado e health de um container Docker."""
-    result = subprocess.run(
-        [
-            "docker",
-            "inspect",
-            "-f",
-            "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
-            container,
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+                container,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None, None
 
     if result.returncode != 0:
+        error = (result.stderr or "").lower()
+        if "no such object" in error or "no such container" in error:
+            return "missing", "none"
         return None, None
 
     output = result.stdout.strip()
@@ -181,9 +275,12 @@ def get_container_info(container):
 
 def docker_is_running():
     """Verifica se o daemon Docker está acessível."""
-    result = subprocess.run(
-        ["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    try:
+        result = subprocess.run(
+            ["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except OSError:
+        return False
 
     return result.returncode == 0
 
@@ -191,18 +288,21 @@ def docker_is_running():
 def get_container_memory(container):
     """Obtém o consumo instantâneo de memória de um container Docker, em MB."""
 
-    result = subprocess.run(
-        [
-            "docker",
-            "stats",
-            "--no-stream",
-            "--format",
-            "{{.MemUsage}}",
-            container,
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "stats",
+                "--no-stream",
+                "--format",
+                "{{.MemUsage}}",
+                container,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
 
     if result.returncode != 0:
         return None
@@ -240,6 +340,92 @@ def get_container_memory(container):
 
     return None
 
+
+def collect_docker():
+    """Coleta somente dados atuais; falha de acesso não consulta valores antigos."""
+    docker = {
+        "daemon": None,
+        "thingsboard": {"status": None, "health": None},
+        "postgresql": {"status": None, "health": None},
+    }
+    if not docker_is_running():
+        docker["missing_components"] = {
+            "docker": {"status": "failed", "reason": "daemon indisponível"},
+            "postgresql": {"status": "failed", "reason": "Docker indisponível"},
+        }
+        return docker, False
+
+    tb_status, tb_health = get_container_info("thingsboard-thingsboard-ce-1")
+    pg_status, pg_health = get_container_info("thingsboard-postgres-1")
+    postgresql = (
+        get_postgresql_info()
+        if pg_status == "running"
+        else {"database_mb": None, "volume_mb": None, "tables": []}
+    )
+    docker.update({
+        "daemon": "running",
+        "thingsboard": {
+            "status": tb_status,
+            "health": tb_health,
+            "memory": get_container_memory("thingsboard-thingsboard-ce-1")
+            if tb_status == "running" else None,
+        },
+        "postgresql": {
+            "status": pg_status,
+            "health": pg_health,
+            "database_mb": postgresql["database_mb"],
+            "volume_mb": postgresql["volume_mb"],
+            "tables": postgresql["tables"],
+            "memory": get_container_memory("thingsboard-postgres-1")
+            if pg_status == "running" else None,
+        },
+    })
+    missing = {}
+    if tb_status is None:
+        missing["docker_thingsboard"] = {
+            "status": "failed", "reason": "falha ao consultar estado do container"
+        }
+    if pg_status is None:
+        missing["docker_postgresql"] = {
+            "status": "failed", "reason": "falha ao consultar estado do container"
+        }
+    if pg_status == "running":
+        if postgresql["database_mb"] is None:
+            missing["postgresql_database"] = {
+                "status": "failed", "reason": "consulta/parser indisponível"
+            }
+        if postgresql["tables"] is None:
+            missing["postgresql_tables"] = {
+                "status": "failed", "reason": "consulta/parser indisponível"
+            }
+        if postgresql["volume_mb"] is None:
+            missing["postgresql_volume"] = {
+                "status": "failed", "reason": "consulta do volume indisponível"
+            }
+        if docker["postgresql"]["memory"] is None:
+            missing["postgresql_memory"] = {
+                "status": "failed", "reason": "docker stats indisponível"
+            }
+    if tb_status == "running" and docker["thingsboard"]["memory"] is None:
+        missing["thingsboard_memory"] = {
+            "status": "failed", "reason": "docker stats indisponível"
+        }
+    docker["missing_components"] = missing
+    return docker, True
+
+
+def finalize_collection(health, save=False, db_path=None):
+    """Valida e, se solicitado, persiste a coleta antes de retornar sucesso."""
+    get_collection_status(health)
+    try:
+        validate_essential_collection(health)
+        if save:
+            save_health(health, db_path=db_path)
+    except Exception:
+        health["collection_status"] = "failed"
+        raise
+    return 0
+
 def get_postgresql_info():
     """Obtém tamanho do banco ThingsBoard e do volume PostgreSQL."""
 
@@ -250,24 +436,27 @@ def get_postgresql_info():
     }
 
     # Tamanho lógico do banco ThingsBoard
-    result = subprocess.run(
-        [
-            "docker",
-            "exec",
-            "thingsboard-postgres-1",
-            "psql",
-            "-U",
-            "postgres",
-            "-d",
-            "thingsboard",
-            "-tAc",
-            "SELECT pg_database_size('thingsboard');",
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "thingsboard-postgres-1",
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "thingsboard",
+                "-tAc",
+                "SELECT pg_database_size('thingsboard');",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        result = None
 
-    if result.returncode == 0:
+    if result is not None and result.returncode == 0:
         try:
             bytes_size = int(result.stdout.strip())
             info["database_mb"] = bytes_size / (1024**2)
@@ -278,18 +467,23 @@ def get_postgresql_info():
             )
     else:
         print(
-            f"ERRO psql: returncode={result.returncode} "
-            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            "ERRO psql: comando indisponível"
+            if result is None
+            else f"ERRO psql: returncode={result.returncode} "
+                 f"stdout={result.stdout!r} stderr={result.stderr!r}"
         )
 
     # Tamanho físico do volume PostgreSQL
-    result = subprocess.run(
-        ["du", "-sm", "/var/lib/docker/volumes/tb-postgres-data/_data"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["du", "-sm", "/var/lib/docker/volumes/tb-postgres-data/_data"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        result = None
 
-    if result.returncode == 0:
+    if result is not None and result.returncode == 0:
         try:
             info["volume_mb"] = int(result.stdout.split()[0])
         except (ValueError, IndexError):
@@ -324,34 +518,37 @@ def get_postgresql_tables():
     ORDER BY schemaname, relname;
     """
 
-    result = subprocess.run(
-        [
-            "docker",
-            "exec",
-            "-i",
-            "thingsboard-postgres-1",
-            "psql",
-            "-U",
-            "postgres",
-            "-d",
-            "thingsboard",
-            "-A",
-            "-F",
-            "|",
-            "-t",
-            "-c",
-            query,
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-i",
+                "thingsboard-postgres-1",
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "thingsboard",
+                "-A",
+                "-F",
+                "|",
+                "-t",
+                "-c",
+                query,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
 
     if result.returncode != 0:
         print(
             f"ERRO PostgreSQL tables: returncode={result.returncode} "
             f"stdout={result.stdout!r} stderr={result.stderr!r}"
         )
-        return []
+        return None
 
     tables = []
 
@@ -363,7 +560,7 @@ def get_postgresql_tables():
         fields = line.split("|")
 
         if len(fields) != 11:
-            continue
+            return None
 
         try:
             tables.append(
@@ -383,41 +580,61 @@ def get_postgresql_tables():
             )
 
         except ValueError:
-            continue
+            return None
 
     return tables
 
 def get_listening_ports():
     """Retorna o conjunto de portas TCP em escuta."""
-    result = subprocess.run(["ss", "-lnt"], capture_output=True, text=True)
+    try:
+        result = subprocess.run(["ss", "-lnt"], capture_output=True, text=True)
+    except OSError:
+        return None
 
     if result.returncode != 0:
-        return set()
+        return None
+
+    lines = result.stdout.splitlines()
+    if not lines or not lines[0].strip().startswith("State"):
+        return None
 
     ports = set()
 
-    for line in result.stdout.splitlines()[1:]:
+    for line in lines[1:]:
         fields = line.split()
 
         if len(fields) < 4:
-            continue
+            return None
 
         local_address = fields[3]
 
         if ":" not in local_address:
-            continue
+            return None
 
         port = local_address.rsplit(":", 1)[-1]
 
-        if port.isdigit():
-            ports.add(int(port))
+        if not port.isdigit():
+            return None
+        ports.add(int(port))
 
     return ports
 
 
+def get_closed_ports(listening_ports, expected_ports):
+    """None indica falha de consulta; set vazio é uma consulta válida."""
+    if listening_ports is None:
+        return None
+    return set(expected_ports) - listening_ports
+
+
 def get_tailscale_ip():
     """Obtém o IPv4 do Tailscale."""
-    result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"], capture_output=True, text=True
+        )
+    except OSError:
+        return None
 
     if result.returncode != 0:
         return None
@@ -430,6 +647,14 @@ def get_tailscale_ip():
     return None
 
 
+def safe_mtime(path):
+    """mtime utilizável para ordenação; arquivo ilegível não interrompe a coleta."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return -1
+
+
 def get_backups(backup_dir):
     """Obtém informações sobre os backups do ThingsBoard."""
     backup_dir = os.path.expanduser(backup_dir)
@@ -437,9 +662,14 @@ def get_backups(backup_dir):
     if not os.path.isdir(backup_dir):
         return None
 
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return None
+
     files = []
 
-    for name in os.listdir(backup_dir):
+    for name in names:
         if not name.startswith("thingsboard_") or not name.endswith(".sql.gz"):
             continue
 
@@ -454,7 +684,7 @@ def get_backups(backup_dir):
             "latest": None,
         }
 
-    latest = max(files, key=os.path.getmtime)
+    latest = max(files, key=safe_mtime)
 
     return {
         "count": len(files),
@@ -494,9 +724,15 @@ def format_size(bytes_size):
 
 def get_updates():
     """Obtém a quantidade de pacotes atualizáveis."""
-    result = subprocess.run(
-        ["apt", "list", "--upgradable"], capture_output=True, text=True, timeout=15
-    )
+    try:
+        result = subprocess.run(
+            ["apt", "list", "--upgradable"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
     if result.returncode != 0:
         return None
@@ -509,10 +745,10 @@ def get_updates():
 
     return count
 
-def save_health(health):
+def save_health(health, db_path=None):
     """Grava a coleta no histórico do neo-health."""
 
-    db_path = "/opt/neo-health/health.db"
+    db_path = db_path or DB_PATH
 
     load = health["system"]["load"]
     memory = health["system"]["memory"]
@@ -524,6 +760,7 @@ def save_health(health):
     pg_memory = docker["postgresql"].get("memory")
 
     with sqlite3.connect(db_path) as conn:
+        initialize_health_schema(conn)
 
         # ----------------------------------------------------
         # Histórico geral
@@ -546,9 +783,11 @@ def save_health(health):
                 tb_memory_mb,
                 pg_memory_mb,
                 tb_database_mb,
-                pg_volume_mb
+                pg_volume_mb,
+                collection_status,
+                missing_components
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 health["timestamp"].isoformat(),
@@ -564,8 +803,11 @@ def save_health(health):
                 health["updates"],
                 tb_memory,
                 pg_memory,
-                docker["thingsboard"].get("database_mb"),
+                docker["postgresql"].get("database_mb"),
                 docker["postgresql"].get("volume_mb"),
+                health["collection_status"],
+                json.dumps(health["missing_components"], ensure_ascii=False)
+                if health["missing_components"] else None,
             ),
         )
 
@@ -596,7 +838,7 @@ def save_health(health):
             """
         )
 
-        for table in docker["postgresql"].get("tables", []):
+        for table in docker["postgresql"].get("tables") or []:
 
             conn.execute(
                 """
@@ -640,7 +882,7 @@ def save_health(health):
 #
 ###################################
 
-def main(save=False):
+def main(save=False, db_path=None):
 
     print()
     print("=" * 60)
@@ -655,7 +897,7 @@ def main(save=False):
     section("SISTEMA")
 
     hostname = socket.gethostname()
-    uptime = run_command(["uptime", "-p"])
+    uptime = run_command_or_none(["uptime", "-p"])
 
     cpu_count = os.cpu_count()
     load = os.getloadavg()
@@ -681,7 +923,7 @@ def main(save=False):
     }
 
     print(f"  {'Host':<20} {hostname}")
-    print(f"  {'Uptime':<20} {uptime}")
+    print(f"  {'Uptime':<20} {uptime if uptime is not None else 'desconhecido'}")
     print(f"  {'Load':<20} {load_text}")
 
     if memory_percent >= 90:
@@ -697,13 +939,18 @@ def main(save=False):
         else:
             ok("Swap", f"0 / {swap_total} MB (0%)")
 
-    disks = {
-        "/": get_disk("/"),
-        "/boot": get_disk("/boot"),
-        "/boot/efi": get_disk("/boot/efi"),
-    }
+    disks = {"/": get_disk("/")}
+    for path in ("/boot", "/boot/efi"):
+        try:
+            disks[path] = get_disk(path)
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            disks[path] = None
 
     for path, disk in disks.items():
+
+        if disk is None:
+            warn(path, "medição indisponível")
+            continue
 
         name = path
 
@@ -777,48 +1024,17 @@ def main(save=False):
 
     section("DOCKER")
 
-    postgresql = get_postgresql_info()
-
-    tb_memory = get_container_memory("thingsboard-thingsboard-ce-1")
-    pg_memory = get_container_memory("thingsboard-postgres-1")
-
-    docker = {
-        "daemon": None,
-        "thingsboard": {
-            "status": None,
-            "health": None,
-        },
-        "postgresql": {
-            "status": None,
-            "health": None,
-        },
-    }
-
-    if docker_is_running():
+    docker, docker_available = collect_docker()
+    if docker_available:
 
         ok("Docker daemon", "running")
-
-        tb_status, tb_health = get_container_info("thingsboard-thingsboard-ce-1")
-
-        pg_status, pg_health = get_container_info("thingsboard-postgres-1")
-
-        docker["daemon"] = "running"
-
-        docker["thingsboard"] = {
-            "status": tb_status,
-            "health": tb_health,
-        }
-
-        docker["postgresql"] = {
-            "status": pg_status,
-            "health": pg_health,
-        }
-
-        docker["postgresql"]["database_mb"] = postgresql["database_mb"]
-        docker["postgresql"]["volume_mb"] = postgresql["volume_mb"]
-        docker["postgresql"]["tables"] = postgresql["tables"]
-        docker["thingsboard"]["memory"] = tb_memory
-        docker["postgresql"]["memory"] = pg_memory
+        postgresql = docker["postgresql"]
+        tb_status = docker["thingsboard"]["status"]
+        tb_health = docker["thingsboard"]["health"]
+        pg_status = docker["postgresql"]["status"]
+        pg_health = docker["postgresql"]["health"]
+        tb_memory = docker["thingsboard"].get("memory")
+        pg_memory = docker["postgresql"].get("memory")
 
         if tb_status == "running":
             ok("ThingsBoard", "running")
@@ -847,6 +1063,7 @@ def main(save=False):
     else:
 
         fail("Docker daemon", "não está acessível")
+        postgresql = docker["postgresql"]
 
     # --------------------------------------------------------
     # SERVIÇOS / PORTAS
@@ -862,12 +1079,16 @@ def main(save=False):
         8883: "MQTT/TLS",
     }
 
-    for port, name in ports.items():
+    closed_ports = get_closed_ports(listening_ports, ports)
+    if closed_ports is None:
+        warn("Portas", "não foi possível consultar ss")
+    else:
+        for port, name in ports.items():
 
-        if port in listening_ports:
-            ok(name, f":{port}")
-        else:
-            fail(name, f":{port} não está escutando")
+            if port not in closed_ports:
+                ok(name, f":{port}")
+            else:
+                fail(name, f":{port} não está escutando")
 
     # --------------------------------------------------------
     # TAILSCALE
@@ -875,16 +1096,17 @@ def main(save=False):
 
     section("TAILSCALE")
 
-    tailscale_active = (
-        subprocess.run(["systemctl", "is-active", "--quiet", "tailscaled"]).returncode
-        == 0
-    )
+    tailscale_state = get_systemd_unit_state("tailscaled")
+
     tailscale = {
-        "active": tailscale_active,
+        "active": tailscale_state,
         "ip": None,
     }
 
-    if tailscale_active:
+    if tailscale_state is None:
+        warn("tailscaled", "não foi possível consultar o systemd")
+
+    elif tailscale_state:
 
         ts_ip = get_tailscale_ip()
 
@@ -919,33 +1141,37 @@ def main(save=False):
         latest = backups["latest"]
         count = backups["count"]
 
-        age = datetime.now().timestamp() - os.path.getmtime(latest)
-
-        print(f"  {'Último backup':<20} {os.path.basename(latest)}")
-        print(f"  {'Idade':<20} {format_age(age)}")
-        print(f"  {'Tamanho':<20} {format_size(os.path.getsize(latest))}")
-        print(f"  {'Quantidade':<20} {count}")
-
         try:
-            with gzip.open(latest, "rb") as f:
-                while f.read(1024 * 1024):
-                    pass
-
-            ok("Integridade", "gzip OK")
-
-        except (OSError, EOFError):
-            fail("Integridade", "backup corrompido")
-
-        age_hours = age / 3600
-
-        if age_hours >= 48:
-            fail("Atualidade", f"último backup há {age_hours:.0f}h")
-
-        elif age_hours >= 26:
-            warn("Atualidade", f"último backup há {age_hours:.0f}h")
-
+            age = datetime.now().timestamp() - os.path.getmtime(latest)
+            size = os.path.getsize(latest)
+        except OSError:
+            fail("Backups", "não foi possível ler o backup mais recente")
         else:
-            ok("Atualidade", "backup recente")
+            print(f"  {'Último backup':<20} {os.path.basename(latest)}")
+            print(f"  {'Idade':<20} {format_age(age)}")
+            print(f"  {'Tamanho':<20} {format_size(size)}")
+            print(f"  {'Quantidade':<20} {count}")
+
+            try:
+                with gzip.open(latest, "rb") as f:
+                    while f.read(1024 * 1024):
+                        pass
+
+                ok("Integridade", "gzip OK")
+
+            except (OSError, EOFError):
+                fail("Integridade", "backup corrompido")
+
+            age_hours = age / 3600
+
+            if age_hours >= 48:
+                fail("Atualidade", f"último backup há {age_hours:.0f}h")
+
+            elif age_hours >= 26:
+                warn("Atualidade", f"último backup há {age_hours:.0f}h")
+
+            else:
+                ok("Atualidade", "backup recente")
 
     # --------------------------------------------------------
     # BACKUP TIMER
@@ -953,46 +1179,77 @@ def main(save=False):
 
     section("BACKUP TIMER")
 
-    timer_active = (
-        subprocess.run(
-            ["systemctl", "is-active", "--quiet", "thingsboard-backup.timer"]
-        ).returncode
-        == 0
-    )
+    timer_state = get_systemd_unit_state("thingsboard-backup.timer")
+    timer_query_failed = timer_state is None
 
     timer = {
-        "active": timer_active,
+        "active": timer_state,
         "next_backup": None,
     }
 
-    if timer_active:
+    if timer_state is None:
+        warn("Timer", "não foi possível consultar o systemd")
 
-        result = subprocess.run(
-            [
-                "systemctl",
-                "list-timers",
-                "thingsboard-backup.timer",
-                "--no-legend",
-                "--no-pager",
-            ],
-            capture_output=True,
-            text=True,
-        )
+    elif timer_state:
 
-        fields = result.stdout.split()
+        try:
+            result = subprocess.run(
+                [
+                    "systemctl",
+                    "list-timers",
+                    "thingsboard-backup.timer",
+                    "--no-legend",
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            result = None
 
-        if len(fields) >= 3:
-            next_backup = " ".join(fields[:3])
-            timer["next_backup"] = next_backup
+        if result is None:
+            timer_query_failed = True
+            warn("Next backup", "não foi possível consultar os timers")
+
         else:
-            next_backup = "desconhecido"
+            fields = result.stdout.split()
 
-        ok("Timer", "active")
-        ok("Next backup", next_backup)
+            if len(fields) >= 3:
+                next_backup = " ".join(fields[:3])
+                timer["next_backup"] = next_backup
+            else:
+                next_backup = "desconhecido"
+
+            ok("Timer", "active")
+            ok("Next backup", next_backup)
 
     else:
 
         fail("Timer", "inactive")
+
+    missing_components = dict(docker.get("missing_components", {}))
+    if temperatures.get("cpu") is None:
+        missing_components["cpu_temp"] = {
+            "status": "unsupported", "reason": "sensor ausente ou não suportado"
+        }
+    if closed_ports is None:
+        missing_components["ports"] = {
+            "status": "failed", "reason": "ss indisponível ou saída inválida"
+        }
+    if uptime is None:
+        missing_components["uptime"] = {
+            "status": "failed", "reason": "comando uptime indisponível"
+        }
+    if tailscale_state is None:
+        missing_components["tailscale"] = {
+            "status": "failed", "reason": "systemd indisponível para tailscaled"
+        }
+    if timer_query_failed:
+        missing_components["backup_timer"] = {
+            "status": "failed", "reason": "systemd indisponível para o timer"
+        }
+
+    collection_status = get_collection_status_value(missing_components)
 
     health = {
         "timestamp": datetime.now(),
@@ -1010,13 +1267,32 @@ def main(save=False):
         "tailscale": tailscale,
         "backups": backups,
         "timer": timer,
+        "collection_status": collection_status,
+        "missing_components": missing_components,
     }
 
-    if save:
-        save_health(health)
+    if collection_status == "partial":
+        print(f"Coleta parcial: {json.dumps(missing_components, ensure_ascii=False)}")
+
+    return finalize_collection(health, save=save, db_path=db_path)
+
+
+def cli(argv=None):
+    parser = argparse.ArgumentParser(description="Coleta de saúde do Neo")
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="salva a coleta no histórico do neo-health",
+    )
+    parser.add_argument("--db", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    try:
+        return main(save=args.save, db_path=args.db)
+    except Exception as error:
+        print(f"Falha na coleta essencial do neo-health: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    save = len(sys.argv) > 1 and sys.argv[1] == "--save"
-    main(save=save)
+    raise SystemExit(cli())
 
