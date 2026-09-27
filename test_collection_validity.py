@@ -233,6 +233,7 @@ class CollectionValidityTests(unittest.TestCase):
         ports=PORTS,
         backups=None,
         run_command_error=None,
+        updates=None,
     ):
         """Executa main(save=True) sem tocar o sistema real; devolve (exit, saída)."""
         command_result = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -270,7 +271,9 @@ class CollectionValidityTests(unittest.TestCase):
             )
             stack.enter_context(patch.object(
                 neo_health, "get_updates",
-                return_value={"total": 0, "important": 0},
+                return_value=(
+                    {"total": 0, "important": 0} if updates is None else updates
+                ),
             ))
             stack.enter_context(
                 patch.object(
@@ -352,14 +355,21 @@ class CollectionValidityTests(unittest.TestCase):
     # P2 — o log de parcialidade reflete o status persistido
     # ----------------------------------------------------------
 
-    def test_p2_partial_log_matches_persisted_status(self):
+    def test_p2_partial_log_is_human_readable_and_matches_persisted_status(self):
         result, output = self.run_collection(ports=None)
         self.assertEqual(result, 0)
         status, details = self.last_row(["collection_status", "missing_components"])
         self.assertEqual(status, "partial")
-        self.assertIn("Coleta parcial: ", output)
-        logged = json.loads(output.split("Coleta parcial: ", 1)[1].splitlines()[0])
-        self.assertEqual(logged, json.loads(details))
+        persisted = json.loads(details)
+
+        # Texto legível: sem JSON interno, mas com toda a informação.
+        self.assertIn("⚠ Coleta parcial", output)
+        self.assertNotIn("{", output)
+        self.assertNotIn('"status"', output)
+
+        for name, item in persisted.items():
+            for line in neo_health.describe_missing_components({name: item}):
+                self.assertIn(line, output)
 
     def test_p2_unsupported_sensor_is_not_reported_as_partial(self):
         result, output = self.run_collection(temperatures={})
@@ -372,6 +382,35 @@ class CollectionValidityTests(unittest.TestCase):
         self.assertNotIn("Coleta parcial", output)
         self.assertIsNone(cpu_temp)
         self.assertIsNone(nvme_temp)
+
+    # ----------------------------------------------------------
+    # Atualizações: comuns são informação; segurança é destaque
+    # ----------------------------------------------------------
+
+    def test_common_updates_are_information_not_warning(self):
+        result, output = self.run_collection(updates={"total": 11, "important": 0})
+        self.assertEqual(result, 0)
+        self.assertIn("ℹ 11 atualizações disponíveis", output)
+        self.assertNotIn("⚠ 11 atualizações disponíveis", output)
+        self.assertNotIn("atualizações de segurança", output)
+
+    def test_security_updates_are_highlighted_separately(self):
+        result, output = self.run_collection(updates={"total": 11, "important": 2})
+        self.assertEqual(result, 0)
+        self.assertIn("ℹ 11 atualizações disponíveis", output)
+        self.assertIn("⚠ 2 atualizações de segurança", output)
+
+    def test_single_common_update_uses_singular(self):
+        result, output = self.run_collection(updates={"total": 1, "important": 0})
+        self.assertEqual(result, 0)
+        self.assertIn("ℹ 1 atualização disponível", output)
+        self.assertNotIn("⚠ 1", output)
+
+    def test_up_to_date_system_keeps_ok_indicator(self):
+        result, output = self.run_collection(updates={"total": 0, "important": 0})
+        self.assertEqual(result, 0)
+        self.assertIn("✓ sistema atualizado", output)
+        self.assertNotIn("atualizações disponíveis", output)
 
     # ----------------------------------------------------------
     # D8 — /boot e /boot/efi não são essenciais
@@ -404,6 +443,85 @@ class CollectionValidityTests(unittest.TestCase):
         self.assertEqual(cpu_temp, 41.0)
         self.assertIsNone(nvme_temp)
         self.assertIsNone(details)
+
+
+class MissingComponentsPresentationTests(unittest.TestCase):
+    """A coleta parcial vira texto legível, sem JSON interno."""
+
+    def test_single_component_preserves_reason(self):
+        self.assertEqual(
+            neo_health.describe_missing_components({
+                "postgresql_volume": {
+                    "status": "failed",
+                    "reason": "consulta do volume indisponível",
+                },
+            }),
+            [
+                "  PostgreSQL volume: indisponível",
+                "  Motivo: consulta do volume indisponível",
+            ],
+        )
+
+    def test_multiple_components_show_each_reason(self):
+        self.assertEqual(
+            neo_health.describe_missing_components({
+                "postgresql_volume": {
+                    "status": "failed",
+                    "reason": "consulta do volume indisponível",
+                },
+                "postgresql_memory": {
+                    "status": "failed",
+                    "reason": "docker stats indisponível",
+                },
+            }),
+            [
+                "  PostgreSQL volume: indisponível",
+                "  Motivo: consulta do volume indisponível",
+                "  PostgreSQL (memória): indisponível",
+                "  Motivo: docker stats indisponível",
+            ],
+        )
+
+    def test_unsupported_sensor_is_not_shown_as_failure(self):
+        self.assertEqual(
+            neo_health.describe_missing_components({
+                "cpu_temp": {
+                    "status": "unsupported",
+                    "reason": "sensor ausente ou não suportado",
+                },
+            }),
+            [
+                "  CPU (temperatura): não suportado",
+                "  Motivo: sensor ausente ou não suportado",
+            ],
+        )
+
+    def test_absent_reason_invents_nothing(self):
+        self.assertEqual(
+            neo_health.describe_missing_components({
+                "tailscale": {"status": "failed"},
+            }),
+            ["  Tailscale: indisponível"],
+        )
+
+    def test_unknown_component_keeps_readable_name(self):
+        self.assertEqual(
+            neo_health.describe_missing_components({
+                "sensor_extra": {"status": "failed", "reason": "leitura inválida"},
+            }),
+            [
+                "  Sensor extra: indisponível",
+                "  Motivo: leitura inválida",
+            ],
+        )
+
+    def test_rendered_lines_expose_no_json(self):
+        text = "\n".join(neo_health.describe_missing_components({
+            "docker": {"status": "failed", "reason": "daemon indisponível"},
+            "ports": {"status": "failed", "reason": "ss indisponível ou saída inválida"},
+        }))
+        for proibido in ("{", "}", "status", "reason"):
+            self.assertNotIn(proibido, text)
 
 
 if __name__ == "__main__":

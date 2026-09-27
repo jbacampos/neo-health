@@ -52,6 +52,65 @@ def get_collection_status_value(missing_components):
     )
 
 
+# Nomes de exibição dos componentes internos da coleta parcial. O sufixo é
+# neutro e não sugere causa: nenhuma informação é criada aqui.
+MISSING_COMPONENT_LABELS = {
+    "docker": "Docker",
+    "docker_thingsboard": "ThingsBoard (container)",
+    "docker_postgresql": "PostgreSQL (container)",
+    "thingsboard_memory": "ThingsBoard (memória)",
+    "postgresql": "PostgreSQL",
+    "postgresql_memory": "PostgreSQL (memória)",
+    "postgresql_database": "PostgreSQL database",
+    "postgresql_volume": "PostgreSQL volume",
+    "postgresql_tables": "PostgreSQL tabelas",
+    "cpu_temp": "CPU (temperatura)",
+    "nvme_temp": "NVMe (temperatura)",
+    "filesystem_root": "Sistema de arquivos /",
+    "ports": "Portas",
+    "uptime": "Uptime",
+    "tailscale": "Tailscale",
+    "backup_timer": "Timer de backup",
+}
+
+# 'unsupported' não é falha de coleta; a distinção é preservada.
+MISSING_STATUS_LABELS = {
+    "failed": "indisponível",
+    "unsupported": "não suportado",
+}
+
+
+def describe_missing_components(missing_components):
+    """Traduz a estrutura interna da coleta parcial em linhas legíveis.
+
+    Preserva toda a informação diagnóstica: cada componente aparece com seu
+    estado e, quando a coleta registrou um motivo, o motivo original é
+    reproduzido sem alteração. Nenhuma causa é inventada e o JSON interno
+    não é exibido — ele continua apenas persistido no histórico.
+    """
+    lines = []
+
+    for name, details in missing_components.items():
+        label = MISSING_COMPONENT_LABELS.get(
+            name, str(name).replace("_", " ").capitalize()
+        )
+
+        if not isinstance(details, dict):
+            # Forma inesperada: o valor é preservado como está.
+            lines.append(f"  {label}: {details}")
+            continue
+
+        status = details.get("status")
+        state = MISSING_STATUS_LABELS.get(status, status)
+        lines.append(f"  {label}: {state}" if state else f"  {label}")
+
+        reason = details.get("reason")
+        if reason:
+            lines.append(f"  Motivo: {reason}")
+
+    return lines
+
+
 def section(title):
     print()
     print(f"── {title} " + "─" * max(0, 54 - len(title)))
@@ -59,6 +118,11 @@ def section(title):
 
 def ok(name, message=""):
     print(f"  {name:<20} ✓ {message}")
+
+
+def info(name, message=""):
+    """Informação neutra: sem indicador de alerta."""
+    print(f"  {name:<20} ℹ {message}")
 
 
 def warn(name, message=""):
@@ -1064,13 +1128,17 @@ def main(save=False, db_path=None):
         total = updates["total"]
         important = updates["important"]
 
-        if important > 0:
-            warn(
-                "Pacotes",
-                f"{total} atualizações disponíveis ({important} de segurança)",
-            )
+        # Atualizações comuns são informação, nunca alerta. As de segurança
+        # são destacadas à parte, mantendo a classificação "-security".
+        if total == 1:
+            info("Pacotes", "1 atualização disponível")
         else:
-            warn("Pacotes", f"{total} atualizações disponíveis")
+            info("Pacotes", f"{total} atualizações disponíveis")
+
+        if important == 1:
+            warn("Segurança", "1 atualização de segurança")
+        elif important > 1:
+            warn("Segurança", f"{important} atualizações de segurança")
 
     # --------------------------------------------------------
     # DOCKER
@@ -1326,7 +1394,12 @@ def main(save=False, db_path=None):
     }
 
     if collection_status == "partial":
-        print(f"Coleta parcial: {json.dumps(missing_components, ensure_ascii=False)}")
+        # Texto legível para o operador; o JSON interno permanece apenas no
+        # histórico (missing_components) e nunca é impresso.
+        print()
+        print("⚠ Coleta parcial")
+        for line in describe_missing_components(missing_components):
+            print(line)
 
     return finalize_collection(health, save=save, db_path=db_path)
 
