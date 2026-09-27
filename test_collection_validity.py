@@ -268,7 +268,10 @@ class CollectionValidityTests(unittest.TestCase):
                     return_value={} if temperatures is None else temperatures,
                 )
             )
-            stack.enter_context(patch.object(neo_health, "get_updates", return_value=0))
+            stack.enter_context(patch.object(
+                neo_health, "get_updates",
+                return_value={"total": 0, "important": 0},
+            ))
             stack.enter_context(
                 patch.object(
                     neo_health,

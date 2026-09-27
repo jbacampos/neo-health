@@ -12,6 +12,9 @@ from datetime import datetime
 
 DB_PATH = "/opt/neo-health/health.db"
 
+# Pocket de segurança do Ubuntu: upgrades vindos daqui são "importantes".
+SECURITY_POCKET_SUFFIX = "-security"
+
 # ============================================================
 # Neo Health Check
 # ============================================================
@@ -161,6 +164,7 @@ def initialize_health_schema(conn):
             cpu_temp REAL, nvme_temp REAL,
             root_used_percent REAL, root_free_bytes INTEGER,
             updates_available INTEGER,
+            updates_important INTEGER,
             tb_memory_mb REAL, pg_memory_mb REAL,
             tb_database_mb REAL, pg_volume_mb REAL
         )"""
@@ -176,6 +180,8 @@ def initialize_health_schema(conn):
         )
     if "missing_components" not in columns:
         conn.execute("ALTER TABLE health ADD COLUMN missing_components TEXT")
+    if "updates_important" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN updates_important INTEGER")
 
 
 def format_disk_free(kb):
@@ -722,8 +728,50 @@ def format_size(bytes_size):
     return f"{bytes_size}B"
 
 
+def is_important_suite(suite):
+    """Diz se o pocket de origem caracteriza uma atualização importante.
+
+    Critério: vem do pocket de segurança do Ubuntu (sufixo `-security`),
+    o mesmo sinal usado pelo unattended-upgrades. É o único discriminador
+    disponível na saída de `apt list --upgradable`; alterá-lo aqui muda a
+    classificação em todo o sistema.
+    """
+    return bool(suite) and suite.endswith(SECURITY_POCKET_SUFFIX)
+
+
+def parse_upgradable_list(stdout):
+    """Conta pacotes atualizáveis e quantos vêm do pocket de segurança.
+
+    Isolado do subprocesso para poder ser exercitado sem o APT.
+    """
+    total = 0
+    important = 0
+
+    for line in stdout.splitlines():
+        if not line or line.startswith("Listing..."):
+            continue
+
+        total += 1
+
+        name, _, remainder = line.partition("/")
+        if not name or not remainder:
+            continue
+
+        suite = remainder.split(" ", 1)[0]
+
+        if is_important_suite(suite):
+            important += 1
+
+    return {"total": total, "important": important}
+
+
 def get_updates():
-    """Obtém a quantidade de pacotes atualizáveis."""
+    """Obtém pacotes atualizáveis, separando os de origem de segurança.
+
+    Devolve {"total": int, "important": int} ou None quando o APT não pôde
+    ser consultado. `apt list --upgradable` expõe o pocket no campo
+    `pacote/pocket`, o que permite distinguir atualizações importantes.
+    """
     try:
         result = subprocess.run(
             ["apt", "list", "--upgradable"],
@@ -737,13 +785,7 @@ def get_updates():
     if result.returncode != 0:
         return None
 
-    count = 0
-
-    for line in result.stdout.splitlines():
-        if line and not line.startswith("Listing..."):
-            count += 1
-
-    return count
+    return parse_upgradable_list(result.stdout)
 
 def save_health(health, db_path=None):
     """Grava a coleta no histórico do neo-health."""
@@ -755,6 +797,7 @@ def save_health(health, db_path=None):
     disk = health["disks"]["/"]
     temperatures = health["temperatures"]
     docker = health["docker"]
+    updates = health["updates"]
 
     tb_memory = docker["thingsboard"].get("memory")
     pg_memory = docker["postgresql"].get("memory")
@@ -780,6 +823,7 @@ def save_health(health, db_path=None):
                 root_used_percent,
                 root_free_bytes,
                 updates_available,
+                updates_important,
                 tb_memory_mb,
                 pg_memory_mb,
                 tb_database_mb,
@@ -787,7 +831,7 @@ def save_health(health, db_path=None):
                 collection_status,
                 missing_components
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 health["timestamp"].isoformat(),
@@ -800,7 +844,8 @@ def save_health(health, db_path=None):
                 temperatures.get("nvme"),
                 disk["percent"],
                 disk["free"] * 1024,
-                health["updates"],
+                updates["total"] if updates else None,
+                updates["important"] if updates else None,
                 tb_memory,
                 pg_memory,
                 docker["postgresql"].get("database_mb"),
@@ -1010,13 +1055,22 @@ def main(save=False, db_path=None):
 
         warn("Pacotes", "não foi possível verificar")
 
-    elif updates == 0:
+    elif updates["total"] == 0:
 
         ok("Pacotes", "sistema atualizado")
 
     else:
 
-        warn("Pacotes", f"{updates} atualizações disponíveis")
+        total = updates["total"]
+        important = updates["important"]
+
+        if important > 0:
+            warn(
+                "Pacotes",
+                f"{total} atualizações disponíveis ({important} de segurança)",
+            )
+        else:
+            warn("Pacotes", f"{total} atualizações disponíveis")
 
     # --------------------------------------------------------
     # DOCKER
