@@ -1045,13 +1045,17 @@ def main(save=False, db_path=None):
     hostname = socket.gethostname()
     uptime = run_command_or_none(["uptime", "-p"])
 
-    cpu_count = os.cpu_count()
+    # Load average do kernel: número de tarefas em execução ou aguardando
+    # (1/5/15 minutos), exatamente como o sistema operacional o reporta.
+    # NÃO é percentual de uso de CPU: por isso o valor não é dividido pelo
+    # número de CPUs nem recebe o símbolo "%". O mesmo valor bruto é o que
+    # já é persistido em health.db (load_1m/load_5m/load_15m).
     load = os.getloadavg()
 
     load_text = (
-        f"{load[0] / cpu_count * 100:.1f}% / "
-        f"{load[1] / cpu_count * 100:.1f}% / "
-        f"{load[2] / cpu_count * 100:.1f}%  (1/5/15m)"
+        f"{load[0]:.1f} / "
+        f"{load[1]:.1f} / "
+        f"{load[2]:.1f}  (1/5/15m)"
     )
 
     (
