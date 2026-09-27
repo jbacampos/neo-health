@@ -524,5 +524,126 @@ class MissingComponentsPresentationTests(unittest.TestCase):
             self.assertNotIn(proibido, text)
 
 
+class PostgresqlVolumePrivilegeTests(unittest.TestCase):
+    """Medir o volume físico exige root; falhas reais mantêm o diagnóstico."""
+
+    PERMISSION_STDERR = (
+        "du: cannot access '/var/lib/docker/volumes/tb-postgres-data/_data': "
+        "Permission denied"
+    )
+
+    def collect(self, du_effect, access):
+        """collect_docker() completo, com apenas o `du` interceptado."""
+
+        def run_effect(command, **kwargs):
+            if command[0] == "du":
+                if isinstance(du_effect, Exception):
+                    raise du_effect
+                return du_effect
+            if "pg_database_size" in " ".join(command):
+                return SimpleNamespace(returncode=0, stdout="12345\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(neo_health, "docker_is_running", return_value=True), patch.object(
+            neo_health, "get_container_info",
+            side_effect=[("running", "healthy"), ("running", "healthy")],
+        ), patch.object(
+            neo_health, "get_container_memory", return_value=20.0
+        ), patch.object(
+            neo_health.subprocess, "run", side_effect=run_effect
+        ), patch.object(
+            neo_health.os, "access", return_value=access
+        ):
+            docker, available = neo_health.collect_docker()
+
+        return docker, available
+
+    def volume_entry(self, docker):
+        return docker["missing_components"]["postgresql_volume"]
+
+    def test_volume_without_privilege_reports_admin_requirement(self):
+        docker, available = self.collect(
+            SimpleNamespace(returncode=1, stdout="", stderr=self.PERMISSION_STDERR),
+            access=False,
+        )
+        self.assertTrue(available)
+        self.assertIsNone(docker["postgresql"]["volume_mb"])
+        entry = self.volume_entry(docker)
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(
+            entry["reason"], "medição requer privilégios de administrador"
+        )
+        # Apresentação: mesma estrutura de coleta parcial, motivo específico.
+        self.assertEqual(
+            neo_health.describe_missing_components({"postgresql_volume": entry}),
+            [
+                "  PostgreSQL volume: indisponível",
+                "  Motivo: medição requer privilégios de administrador",
+            ],
+        )
+
+    def test_permission_message_in_portuguese_is_detected(self):
+        stderr = (
+            "du: não foi possível acessar "
+            "'/var/lib/docker/volumes/tb-postgres-data/_data': Permissão negada"
+        )
+        docker, _ = self.collect(
+            SimpleNamespace(returncode=1, stdout="", stderr=stderr), access=True,
+        )
+        self.assertEqual(
+            self.volume_entry(docker)["reason"],
+            "medição requer privilégios de administrador",
+        )
+
+    def test_real_volume_error_is_not_reported_as_privilege(self):
+        docker, _ = self.collect(
+            SimpleNamespace(
+                returncode=1, stdout="",
+                stderr="du: cannot access 'x': No such file or directory",
+            ),
+            access=True,
+        )
+        self.assertEqual(
+            self.volume_entry(docker)["reason"], "consulta do volume indisponível"
+        )
+
+    def test_missing_du_tool_is_not_reported_as_privilege(self):
+        docker, _ = self.collect(FileNotFoundError("du"), access=True)
+        self.assertEqual(
+            self.volume_entry(docker)["reason"], "consulta do volume indisponível"
+        )
+
+    def test_volume_measured_with_privilege_has_no_missing_entry(self):
+        docker, _ = self.collect(
+            SimpleNamespace(
+                returncode=0, stdout="451\t/var/lib/docker/volumes/x/_data\n",
+                stderr="",
+            ),
+            access=True,
+        )
+        self.assertEqual(docker["postgresql"]["volume_mb"], 451)
+        self.assertNotIn("postgresql_volume", docker["missing_components"])
+
+    def test_admin_requirement_keeps_collection_partial_reason(self):
+        docker, _ = self.collect(
+            SimpleNamespace(returncode=1, stdout="", stderr=self.PERMISSION_STDERR),
+            access=False,
+        )
+        health = {
+            "system": {
+                "load": (0.1, 0.2, 0.3),
+                "memory": {"used_mb": 100, "percent": 20},
+            },
+            "disks": {"/": {"percent": 10, "free": 900}},
+            "missing_components": docker["missing_components"],
+        }
+        neo_health.get_collection_status(health)
+        self.assertEqual(health["collection_status"], "partial")
+        self.assertEqual(
+            health["missing_components"]["postgresql_volume"]["reason"],
+            "medição requer privilégios de administrador",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

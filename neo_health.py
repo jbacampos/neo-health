@@ -15,6 +15,19 @@ DB_PATH = "/opt/neo-health/health.db"
 # Pocket de segurança do Ubuntu: upgrades vindos daqui são "importantes".
 SECURITY_POCKET_SUFFIX = "-security"
 
+# Caminho físico do volume de dados do PostgreSQL. O Docker protege
+# /var/lib/docker, então medir esse tamanho exige privilégio de root; quando
+# o processo atual não puder acessá-lo, a medição é reportada como
+# dependente de privilégios de administrador (sem virar falha fatal).
+POSTGRESQL_VOLUME_PATH = "/var/lib/docker/volumes/tb-postgres-data/_data"
+
+# Palavras que, na saída do `du`, indicam permissão insuficiente. O idioma
+# acompanha o sistema (mensagens em inglês ou português).
+PERMISSION_DENIED_MARKERS = (
+    "permission denied",
+    "permissão negada",
+)
+
 # ============================================================
 # Neo Health Check
 # ============================================================
@@ -470,7 +483,12 @@ def collect_docker():
             }
         if postgresql["volume_mb"] is None:
             missing["postgresql_volume"] = {
-                "status": "failed", "reason": "consulta do volume indisponível"
+                "status": "failed",
+                "reason": (
+                    "medição requer privilégios de administrador"
+                    if postgresql.get("volume_requires_admin")
+                    else "consulta do volume indisponível"
+                ),
             }
         if docker["postgresql"]["memory"] is None:
             missing["postgresql_memory"] = {
@@ -495,6 +513,21 @@ def finalize_collection(health, save=False, db_path=None):
         health["collection_status"] = "failed"
         raise
     return 0
+
+def postgresql_volume_requires_admin(result=None):
+    """Diz se a medição do volume depende de privilégio que o processo não tem.
+
+    Interpreta apenas o que já aconteceu: usa a saída do `du` que falhou e,
+    quando a ferramenta nem executou, a permissão real do processo atual
+    sobre o caminho do volume. Nenhum comando privilegiado é executado e
+    falhas que não são de permissão continuam com o diagnóstico habitual.
+    """
+    if result is not None:
+        detail = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+        return any(marker in detail for marker in PERMISSION_DENIED_MARKERS)
+
+    return not os.access(POSTGRESQL_VOLUME_PATH, os.R_OK | os.X_OK)
+
 
 def get_postgresql_info():
     """Obtém tamanho do banco ThingsBoard e do volume PostgreSQL."""
@@ -546,7 +579,7 @@ def get_postgresql_info():
     # Tamanho físico do volume PostgreSQL
     try:
         result = subprocess.run(
-            ["du", "-sm", "/var/lib/docker/volumes/tb-postgres-data/_data"],
+            ["du", "-sm", POSTGRESQL_VOLUME_PATH],
             capture_output=True,
             text=True,
         )
@@ -561,6 +594,10 @@ def get_postgresql_info():
                 f"ERRO Volume PostgreSQL: stdout={result.stdout!r} "
                 f"stderr={result.stderr!r}"
             )
+    elif postgresql_volume_requires_admin(result):
+        # O PostgreSQL e o volume estão saudáveis: o que falta é privilégio
+        # para medir o tamanho físico. Não é falha do banco nem do volume.
+        info["volume_requires_admin"] = True
 
     # Informações das tabelas PostgreSQL
     info["tables"] = get_postgresql_tables()
