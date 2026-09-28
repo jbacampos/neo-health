@@ -1172,14 +1172,14 @@ def main(save=False, db_path=None):
         # Atualizações comuns são informação, nunca alerta. As de segurança
         # são destacadas à parte, mantendo a classificação "-security".
         if total == 1:
-            info("Pacotes", "1 atualização disponível")
+            info("Pacotes", " 1 atualização disponível")
         else:
-            info("Pacotes", f"{total} atualizações disponíveis")
+            info("Pacotes", f" {total} atualizações disponíveis")
 
         if important == 1:
-            warn("Segurança", "1 atualização de segurança")
+            warn("Segurança", " 1 atualização de segurança")
         elif important > 1:
-            warn("Segurança", f"{important} atualizações de segurança")
+            warn("Segurança", f" {important} atualizações de segurança")
 
     # --------------------------------------------------------
     # DOCKER
