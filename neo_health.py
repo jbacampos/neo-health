@@ -5,9 +5,12 @@ import socket
 import sqlite3
 import subprocess
 import gzip
+import hashlib
 import sys
 import argparse
 import json
+import tarfile
+import zlib
 from datetime import datetime
 
 DB_PATH = "/opt/neo-health/health.db"
@@ -27,6 +30,48 @@ PERMISSION_DENIED_MARKERS = (
     "permission denied",
     "permissão negada",
 )
+
+# ============================================================
+# BACKUP DIÁRIO DO SISTEMA
+#
+# O artefato é produzido por /usr/local/sbin/neo-backup-system.sh, que o
+# daily_workflow do neo-analysis executa imediatamente antes desta coleta.
+# A verificação aqui é INDEPENDENTE daquele processo: o diretório é relido,
+# o gzip é percorrido até o fim, o SHA-256 é recalculado a partir do
+# arquivo .sha256 e o conteúdo do TAR é conferido. Nada nesta seção pode
+# interromper a coleta essencial.
+# ============================================================
+
+SYSTEM_BACKUP_DIR = "/mnt/neo-backup/neo-system"
+
+# Volume que precisa estar montado para o backup existir de fato. Um
+# diretório vazio (ou com conteúdo antigo do disco raiz) não é um backup
+# ausente: é uma verificação que não pôde ser executada.
+BACKUP_VOLUME_PATH = "/mnt/neo-backup"
+
+SYSTEM_BACKUP_PREFIX = "neo-system_"
+SYSTEM_BACKUP_SUFFIX = ".tar.gz"
+SYSTEM_BACKUP_CHECKSUM_SUFFIX = ".sha256"
+
+# O backup é executado imediatamente antes da coleta, então a idade do
+# artefato nesta verificação é praticamente zero. Um limite curto detecta
+# a falha do dia no próprio dia, sem falso positivo.
+BACKUP_MAX_AGE_HOURS = 6
+
+# Bloco de leitura usado no gzip e no cálculo do SHA-256.
+HASH_CHUNK_SIZE = 1024 * 1024
+
+# Membros cuja ausência caracteriza backup sem conteúdo essencial.
+SYSTEM_BACKUP_REQUIRED_MEMBERS = (
+    "opt/neo-health/health.db",
+    "opt/neo-analysis/notification_state.db",
+    "home/jc/thingsboard/docker-compose.yml",
+    "etc/systemd/system/neo-analysis.service",
+    "etc/fstab",
+)
+
+# O motivo é persistido e depois exibido: mesmo limite dos demais motivos.
+MAX_BACKUP_REASON_LENGTH = 200
 
 # ============================================================
 # Neo Health Check
@@ -259,6 +304,25 @@ def initialize_health_schema(conn):
         conn.execute("ALTER TABLE health ADD COLUMN missing_components TEXT")
     if "updates_important" not in columns:
         conn.execute("ALTER TABLE health ADD COLUMN updates_important INTEGER")
+    # Backup diário do sistema. Sem DEFAULT: NULL significa "não
+    # verificado", e nenhuma verificação que não ocorreu é registrada
+    # como 'ok'. Assim os registros existentes permanecem intocados.
+    if "backup_status" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN backup_status TEXT")
+    if "backup_artifact" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN backup_artifact TEXT")
+    if "backup_size_bytes" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN backup_size_bytes INTEGER")
+    if "backup_age_hours" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN backup_age_hours REAL")
+    if "backup_gzip_ok" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN backup_gzip_ok INTEGER")
+    if "backup_sha256_ok" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN backup_sha256_ok INTEGER")
+    if "backup_sha256" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN backup_sha256 TEXT")
+    if "backup_reason" not in columns:
+        conn.execute("ALTER TABLE health ADD COLUMN backup_reason TEXT")
 
 
 def format_disk_free(kb):
@@ -829,6 +893,382 @@ def format_size(bytes_size):
     return f"{bytes_size}B"
 
 
+def sanitize_backup_reason(reason):
+    """Normaliza o motivo, que é persistido e posteriormente exibido."""
+    if reason is None:
+        return None
+
+    text = " ".join(str(reason).split())
+
+    if len(text) > MAX_BACKUP_REASON_LENGTH:
+        text = text[:MAX_BACKUP_REASON_LENGTH] + "…"
+
+    return text or None
+
+
+def backup_volume_is_mounted(backup_dir=None):
+    """Diz se o volume que contém o backup está montado.
+
+    Backup ausente porque o volume não foi montado não é a mesma coisa que
+    backup não gerado: sem o volume, a verificação não pôde ser executada.
+    """
+    path = os.path.abspath(backup_dir or SYSTEM_BACKUP_DIR)
+
+    try:
+        return os.path.ismount(os.path.dirname(path))
+    except OSError:
+        return False
+
+
+def get_system_backups(backup_dir=None):
+    """Obtém o backup do sistema mais recente.
+
+    Devolve {"count": int, "latest": caminho} ou None quando o diretório
+    não pôde ser lido. O arquivo .sha256 nunca é candidato: o nome do
+    artefato precisa terminar em .tar.gz.
+    """
+    backup_dir = os.path.expanduser(backup_dir or SYSTEM_BACKUP_DIR)
+
+    if not os.path.isdir(backup_dir):
+        return None
+
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return None
+
+    files = []
+
+    for name in names:
+        if not name.startswith(SYSTEM_BACKUP_PREFIX):
+            continue
+
+        if not name.endswith(SYSTEM_BACKUP_SUFFIX):
+            continue
+
+        path = os.path.join(backup_dir, name)
+
+        if os.path.isfile(path):
+            files.append(path)
+
+    if not files:
+        return {
+            "count": 0,
+            "latest": None,
+        }
+
+    return {
+        "count": len(files),
+        "latest": max(files, key=safe_mtime),
+    }
+
+
+def gzip_integrity_ok(path):
+    """Percorre o gzip inteiro; corrupção em qualquer ponto reprova.
+
+    `zlib.error` precisa ser tratado aqui: um fluxo com cabeçalho gzip
+    válido mas corpo deflate corrompido abre normalmente e falha apenas
+    durante a leitura. Sem esta exceção, o erro escaparia da verificação
+    e a corrupção seria classificada como indisponibilidade em vez de
+    falha de integridade.
+    """
+    try:
+        with gzip.open(path, "rb") as handle:
+            while handle.read(HASH_CHUNK_SIZE):
+                pass
+
+    except (OSError, EOFError, zlib.error):
+        return False
+
+    return True
+
+
+def sha256_of_file(path):
+    """SHA-256 do arquivo, lido em blocos; None se não pôde ser calculado."""
+    digest = hashlib.sha256()
+
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                block = handle.read(HASH_CHUNK_SIZE)
+                if not block:
+                    break
+                digest.update(block)
+
+    except OSError:
+        return None
+
+    return digest.hexdigest()
+
+
+def read_checksum_file(path):
+    """Lê o arquivo .sha256 no formato produzido por `sha256sum`.
+
+    Devolve (hash, nome_referenciado) ou None quando o arquivo não existe,
+    não pôde ser lido ou está malformado. A ausência do checksum não é
+    divergência: é impossibilidade de comparar, e o resultado persistido
+    fica NULL — nunca 0 e nunca 1.
+
+    O nome referenciado é devolvido de propósito: o checksum só vale para
+    o arquivo que ele nomeia. Cabe ao chamador compará-lo com o artefato
+    analisado — um nome diferente é divergência, não ausência.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            line = handle.readline().strip()
+
+    except OSError:
+        return None
+
+    if not line:
+        return None
+
+    parts = line.split()
+
+    if len(parts) < 2:
+        return None
+
+    digest = parts[0].lstrip("*")
+    name = parts[1].lstrip("*")
+
+    if len(digest) != 64 or not all(
+        character in "0123456789abcdefABCDEF" for character in digest
+    ):
+        return None
+
+    return digest.lower(), name
+
+
+def normalize_tar_member(name):
+    """Normaliza o nome de um membro do TAR para comparação."""
+    normalized = str(name).replace("\\", "/")
+
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+
+    return normalized.lstrip("/").rstrip("/")
+
+
+def tar_missing_members(path, required=None):
+    """Devolve os membros essenciais ausentes, ou None se o TAR não abrir.
+
+    Cada membro essencial precisa existir como ARQUIVO REGULAR. Diretório,
+    link simbólico, hard link, FIFO ou dispositivo com o mesmo nome não
+    substitui o arquivo: só o arquivo carrega o conteúdo que o backup
+    promete guardar.
+    """
+    required = required or SYSTEM_BACKUP_REQUIRED_MEMBERS
+
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            members = [
+                (normalize_tar_member(info.name), info)
+                for info in archive.getmembers()
+            ]
+
+    except (OSError, EOFError, zlib.error, tarfile.TarError):
+        return None
+
+    missing = []
+
+    for expected in required:
+        # Comparação exata ou por sufixo de caminho: o TAR pode ter sido
+        # gravado a partir de uma raiz diferente, com prefixo.
+        if any(
+            (name == expected or name.endswith("/" + expected))
+            and info.isfile()
+            for name, info in members
+        ):
+            continue
+
+        missing.append(expected)
+
+    return missing
+
+
+def collect_system_backup(backup_dir=None):
+    """Verifica o backup diário do sistema, sem nunca levantar exceção.
+
+    Estados:
+      ok          todas as verificações passaram;
+      failed      corrupção (gzip ou TAR), SHA-256 divergente, checksum que
+                  nomeia outro arquivo ou conteúdo essencial ausente;
+      missing     não existe backup recente — inclusive quando o volume
+                  está montado e o diretório de backup ainda não existe;
+      unavailable verificação impossível: volume não montado, diretório
+                  inacessível, artefato ilegível ou checksum ausente.
+
+    A ausência do arquivo .sha256 não é divergência: é impossibilidade de
+    comparar, então backup_sha256_ok fica NULL.
+    """
+    backup_dir = os.path.expanduser(backup_dir or SYSTEM_BACKUP_DIR)
+
+    result = {
+        "status": "unavailable",
+        "artifact": None,
+        "size_bytes": None,
+        "age_hours": None,
+        "gzip_ok": None,
+        "sha256_ok": None,
+        "sha256": None,
+        "reason": None,
+    }
+
+    if not backup_volume_is_mounted(backup_dir):
+        result["reason"] = sanitize_backup_reason(
+            "volume de backup não está montado"
+        )
+        return result
+
+    if not os.path.isdir(backup_dir):
+        # Volume montado e diretório inexistente: nenhum backup foi
+        # produzido ainda. Isso é ausência, não impossibilidade de
+        # verificar — distinta de um diretório que existe e não pode ser
+        # lido, tratado abaixo.
+        result["status"] = "missing"
+        result["reason"] = sanitize_backup_reason(
+            "diretório de backup ausente"
+        )
+        return result
+
+    backups = get_system_backups(backup_dir)
+
+    if backups is None:
+        # O diretório existe (verificado acima) e mesmo assim não pôde ser
+        # lido: permissão ou falha de I/O. Nada se afirma sobre o backup.
+        result["reason"] = sanitize_backup_reason(
+            f"diretório de backup inacessível: {backup_dir}"
+        )
+        return result
+
+    if not backups["count"]:
+        result["status"] = "missing"
+        result["reason"] = sanitize_backup_reason("nenhum backup encontrado")
+        return result
+
+    latest = backups["latest"]
+    result["artifact"] = os.path.basename(latest)
+
+    try:
+        size = os.path.getsize(latest)
+        mtime = os.path.getmtime(latest)
+
+    except OSError:
+        result["reason"] = sanitize_backup_reason(
+            "não foi possível ler o backup mais recente"
+        )
+        return result
+
+    result["size_bytes"] = size
+
+    age_seconds = max(datetime.now().timestamp() - mtime, 0.0)
+    result["age_hours"] = round(age_seconds / 3600, 2)
+
+    if age_seconds > BACKUP_MAX_AGE_HOURS * 3600:
+        result["status"] = "missing"
+        result["reason"] = sanitize_backup_reason(
+            f"backup mais recente há {result['age_hours']:.0f}h"
+        )
+        return result
+
+    result["gzip_ok"] = 1 if gzip_integrity_ok(latest) else 0
+
+    if not result["gzip_ok"]:
+        result["status"] = "failed"
+        result["reason"] = sanitize_backup_reason("backup corrompido (gzip)")
+        return result
+
+    expected = read_checksum_file(
+        latest + SYSTEM_BACKUP_CHECKSUM_SUFFIX
+    )
+    result["sha256"] = sha256_of_file(latest)
+
+    if expected is None or result["sha256"] is None:
+        # Não houve comparação: o resultado é NULL, nunca 0 e nunca 1.
+        result["sha256_ok"] = None
+        result["reason"] = sanitize_backup_reason(
+            "verificação SHA-256 indisponível"
+            if expected is None
+            else "não foi possível calcular o SHA-256 do backup"
+        )
+        return result
+
+    # O checksum vale para o arquivo que ele nomeia. Um nome diferente
+    # significa que a referência não corresponde ao artefato analisado:
+    # é divergência (0), não ausência (NULL).
+    if expected[1] != result["artifact"]:
+        result["sha256_ok"] = 0
+        result["status"] = "failed"
+        result["reason"] = sanitize_backup_reason(
+            f"checksum refere outro arquivo: {expected[1]}"
+        )
+        return result
+
+    result["sha256_ok"] = 1 if result["sha256"] == expected[0] else 0
+
+    if not result["sha256_ok"]:
+        result["status"] = "failed"
+        result["reason"] = sanitize_backup_reason("SHA-256 divergente")
+        return result
+
+    missing = tar_missing_members(latest)
+
+    if missing is None:
+        result["status"] = "failed"
+        result["reason"] = sanitize_backup_reason("backup corrompido (tar)")
+        return result
+
+    if missing:
+        result["status"] = "failed"
+        result["reason"] = sanitize_backup_reason(
+            "conteúdo essencial ausente: " + ", ".join(missing)
+        )
+        return result
+
+    result["status"] = "ok"
+    return result
+
+
+def print_system_backup(backup):
+    """Imprime o resultado da verificação do backup do sistema."""
+    if not backup:
+        warn("Backup do sistema", "não verificado")
+        return
+
+    if backup.get("artifact"):
+        print(f"  {'Arquivo':<20} {backup['artifact']}")
+
+    if backup.get("age_hours") is not None:
+        print(f"  {'Idade':<20} {format_age(backup['age_hours'] * 3600)}")
+
+    if backup.get("size_bytes") is not None:
+        print(f"  {'Tamanho':<20} {format_size(backup['size_bytes'])}")
+
+    status = backup.get("status")
+    reason = backup.get("reason")
+
+    if status == "ok":
+        ok("Integridade", "gzip e SHA-256 OK")
+        ok("Conteúdo", f"{len(SYSTEM_BACKUP_REQUIRED_MEMBERS)} membros essenciais")
+        ok("Atualidade", "backup recente")
+        return
+
+    if status == "failed":
+        if backup.get("gzip_ok") == 0:
+            fail("Integridade", "backup corrompido (gzip)")
+        elif backup.get("sha256_ok") == 0:
+            fail("Integridade", "SHA-256 divergente")
+        else:
+            fail("Conteúdo", reason or "backup inválido")
+        return
+
+    if status == "missing":
+        fail("Atualidade", reason or "nenhum backup recente")
+        return
+
+    warn("Verificação", reason or "não foi possível verificar o backup")
+
+
 def is_important_suite(suite):
     """Diz se o pocket de origem caracteriza uma atualização importante.
 
@@ -903,6 +1343,10 @@ def save_health(health, db_path=None):
     tb_memory = docker["thingsboard"].get("memory")
     pg_memory = docker["postgresql"].get("memory")
 
+    # Verificação independente do backup diário do sistema. Ausente em
+    # chamadas antigas (testes, uso manual): todas as colunas ficam NULL.
+    system_backup = health.get("system_backup") or {}
+
     with sqlite3.connect(db_path) as conn:
         initialize_health_schema(conn)
 
@@ -930,9 +1374,20 @@ def save_health(health, db_path=None):
                 tb_database_mb,
                 pg_volume_mb,
                 collection_status,
-                missing_components
+                missing_components,
+                backup_status,
+                backup_artifact,
+                backup_size_bytes,
+                backup_age_hours,
+                backup_gzip_ok,
+                backup_sha256_ok,
+                backup_sha256,
+                backup_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             """,
             (
                 health["timestamp"].isoformat(),
@@ -954,6 +1409,14 @@ def save_health(health, db_path=None):
                 health["collection_status"],
                 json.dumps(health["missing_components"], ensure_ascii=False)
                 if health["missing_components"] else None,
+                system_backup.get("status"),
+                system_backup.get("artifact"),
+                system_backup.get("size_bytes"),
+                system_backup.get("age_hours"),
+                system_backup.get("gzip_ok"),
+                system_backup.get("sha256_ok"),
+                system_backup.get("sha256"),
+                system_backup.get("reason"),
             ),
         )
 
@@ -1337,6 +1800,35 @@ def main(save=False, db_path=None):
                 ok("Atualidade", "backup recente")
 
     # --------------------------------------------------------
+    # BACKUP DO SISTEMA
+    #
+    # Verificação independente do artefato produzido pelo workflow
+    # imediatamente antes desta coleta. Não altera collection_status
+    # nem missing_components: falha de backup é achado, não falha de
+    # coleta, e nada aqui interrompe a coleta essencial.
+    # --------------------------------------------------------
+
+    section("BACKUP DO SISTEMA")
+
+    try:
+        system_backup = collect_system_backup()
+    except Exception as error:  # nunca interrompe a coleta essencial
+        system_backup = {
+            "status": "unavailable",
+            "artifact": None,
+            "size_bytes": None,
+            "age_hours": None,
+            "gzip_ok": None,
+            "sha256_ok": None,
+            "sha256": None,
+            "reason": sanitize_backup_reason(
+                f"verificação do backup falhou: {type(error).__name__}"
+            ),
+        }
+
+    print_system_backup(system_backup)
+
+    # --------------------------------------------------------
     # BACKUP TIMER
     # --------------------------------------------------------
 
@@ -1430,6 +1922,7 @@ def main(save=False, db_path=None):
         "tailscale": tailscale,
         "backups": backups,
         "timer": timer,
+        "system_backup": system_backup,
         "collection_status": collection_status,
         "missing_components": missing_components,
     }

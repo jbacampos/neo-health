@@ -2,12 +2,15 @@
 
 import importlib.util
 import contextlib
+import hashlib
 import io
 import json
 import os
 import sqlite3
 import subprocess
+import tarfile
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
@@ -643,6 +646,566 @@ class PostgresqlVolumePrivilegeTests(unittest.TestCase):
             health["missing_components"]["postgresql_volume"]["reason"],
             "medição requer privilégios de administrador",
         )
+
+
+class SystemBackupTests(unittest.TestCase):
+    """Verificação independente do backup diário do sistema."""
+
+    MEMBERS = neo_health.SYSTEM_BACKUP_REQUIRED_MEMBERS
+
+    BACKUP_COLUMNS = (
+        "backup_status",
+        "backup_artifact",
+        "backup_size_bytes",
+        "backup_age_hours",
+        "backup_gzip_ok",
+        "backup_sha256_ok",
+        "backup_sha256",
+        "backup_reason",
+    )
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+        self.backup_dir = os.path.join(self.temp_dir.name, "neo-system")
+        os.mkdir(self.backup_dir)
+
+        self.db_path = os.path.join(self.temp_dir.name, "health.db")
+
+        # No ambiente de teste o volume operacional não existe: o estado do
+        # volume é declarado, e nenhum caminho real é acessado.
+        mounted = patch.object(
+            neo_health, "backup_volume_is_mounted", return_value=True,
+        )
+        mounted.start()
+        self.addCleanup(mounted.stop)
+
+    # ---------------------------------------------------------
+    # Apoio
+    # ---------------------------------------------------------
+
+    def make_backup(self, members=None, name=None, mtime=None):
+        """Cria um artefato .tar.gz real com os membros pedidos."""
+        members = self.MEMBERS if members is None else members
+        name = name or f"neo-system_{datetime.now():%Y-%m-%d}.tar.gz"
+        path = os.path.join(self.backup_dir, name)
+
+        with tarfile.open(path, "w:gz") as archive:
+            for member in members:
+                data = b"conteudo"
+                info = tarfile.TarInfo(member)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+
+        return path
+
+    def make_raw_backup(self, entries, name=None):
+        """Cria um artefato com membros de tipos explícitos no TAR."""
+        name = name or f"neo-system_{datetime.now():%Y-%m-%d}.tar.gz"
+        path = os.path.join(self.backup_dir, name)
+
+        with tarfile.open(path, "w:gz") as archive:
+            for entry in entries:
+                info = tarfile.TarInfo(entry["name"])
+                info.type = entry.get("type", tarfile.REGTYPE)
+
+                if info.type in (tarfile.REGTYPE, tarfile.AREGTYPE):
+                    data = b"conteudo"
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+                else:
+                    info.linkname = entry.get("linkname", "")
+                    archive.addfile(info)
+
+        return path
+
+    def write_checksum(self, path, digest=None):
+        """Escreve o .sha256 no formato do `sha256sum`."""
+        if digest is None:
+            with open(path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+
+        checksum = path + neo_health.SYSTEM_BACKUP_CHECKSUM_SUFFIX
+
+        with open(checksum, "w", encoding="utf-8") as handle:
+            handle.write(f"{digest}  {os.path.basename(path)}\n")
+
+        return checksum
+
+    def complete_backup(self, **kwargs):
+        path = self.make_backup(**kwargs)
+        self.write_checksum(path)
+        return path
+
+    def persisted_backup(self):
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                "SELECT backup_status, backup_artifact, backup_size_bytes, "
+                "backup_age_hours, backup_gzip_ok, backup_sha256_ok, "
+                "backup_sha256, backup_reason FROM health ORDER BY id DESC "
+                "LIMIT 1"
+            ).fetchone()
+
+
+    # ---------------------------------------------------------
+    # Backup válido
+    # ---------------------------------------------------------
+
+    def test_valid_backup_is_ok(self):
+        path = self.complete_backup()
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "ok")
+        self.assertEqual(backup["gzip_ok"], 1)
+        self.assertEqual(backup["sha256_ok"], 1)
+        self.assertEqual(backup["artifact"], os.path.basename(path))
+        self.assertEqual(backup["size_bytes"], os.path.getsize(path))
+        self.assertLess(backup["age_hours"], 1)
+        self.assertIsNone(backup["reason"])
+
+        with open(path, "rb") as handle:
+            expected = hashlib.sha256(handle.read()).hexdigest()
+        self.assertEqual(backup["sha256"], expected)
+
+    def test_valid_backup_is_persisted(self):
+        self.complete_backup()
+
+        health = sample()
+        health["system_backup"] = neo_health.collect_system_backup(
+            self.backup_dir
+        )
+
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        row = self.persisted_backup()
+
+        self.assertEqual(row[0], "ok")
+        self.assertTrue(row[1].startswith("neo-system_"))
+        self.assertGreater(row[2], 0)
+        self.assertLess(row[3], 1)
+        self.assertEqual(row[4], 1)
+        self.assertEqual(row[5], 1)
+        self.assertEqual(len(row[6]), 64)
+        self.assertIsNone(row[7])
+
+    # ---------------------------------------------------------
+    # Falhas de integridade
+    # ---------------------------------------------------------
+
+    def test_corrupted_gzip_fails(self):
+        path = os.path.join(
+            self.backup_dir, "neo-system_2026-10-30.tar.gz"
+        )
+
+        with open(path, "wb") as handle:
+            handle.write(b"isto nao e um fluxo gzip valido")
+
+        self.write_checksum(path)
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+        self.assertEqual(backup["gzip_ok"], 0)
+        # Sem gzip válido a comparação não chega a ocorrer.
+        self.assertIsNone(backup["sha256_ok"])
+        self.assertIn("gzip", backup["reason"])
+
+    def test_gzip_header_with_corrupted_deflate_stream_fails(self):
+        """Cabeçalho gzip válido e corpo deflate corrompido: zlib.error."""
+        path = os.path.join(
+            self.backup_dir, "neo-system_2026-10-30.tar.gz"
+        )
+
+        with open(path, "wb") as handle:
+            handle.write(
+                b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03"
+                + b"\xff" * 10
+            )
+
+        self.write_checksum(path)
+
+        # A exceção precisa ser contida aqui, não tratada como
+        # indisponibilidade pela camada de cima.
+        self.assertFalse(neo_health.gzip_integrity_ok(path))
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+        self.assertEqual(backup["gzip_ok"], 0)
+        self.assertIn("gzip", backup["reason"])
+
+    def test_divergent_sha256_fails(self):
+        path = self.complete_backup()
+        self.write_checksum(path, digest="0" * 64)
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+        self.assertEqual(backup["gzip_ok"], 1)
+        self.assertEqual(backup["sha256_ok"], 0)
+        self.assertIn("SHA-256", backup["reason"])
+
+    def test_absent_checksum_is_unavailable_with_null_sha256(self):
+        self.make_backup()
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        # Não houve comparação: NULL, nunca 0 e nunca 1.
+        self.assertEqual(backup["status"], "unavailable")
+        self.assertEqual(backup["gzip_ok"], 1)
+        self.assertIsNone(backup["sha256_ok"])
+        self.assertEqual(len(backup["sha256"]), 64)
+        self.assertIn("SHA-256", backup["reason"])
+
+    def test_checksum_name_matching_artifact_is_ok(self):
+        path = self.complete_backup(name="neo-system_2026-10-30.tar.gz")
+
+        parsed = neo_health.read_checksum_file(
+            path + neo_health.SYSTEM_BACKUP_CHECKSUM_SUFFIX
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[1], "neo-system_2026-10-30.tar.gz")
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "ok")
+        self.assertEqual(backup["sha256_ok"], 1)
+
+    def test_checksum_referring_another_file_fails(self):
+        """Hash correto, mas o checksum nomeia outro arquivo: divergência."""
+        path = self.complete_backup(name="neo-system_2026-10-30.tar.gz")
+
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+
+        checksum = path + neo_health.SYSTEM_BACKUP_CHECKSUM_SUFFIX
+
+        with open(checksum, "w", encoding="utf-8") as handle:
+            handle.write(f"{digest}  neo-system_2026-10-29.tar.gz\n")
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+        self.assertEqual(backup["gzip_ok"], 1)
+        # A comparação foi feita e não corresponde: 0, nunca NULL.
+        self.assertEqual(backup["sha256_ok"], 0)
+        self.assertIn("neo-system_2026-10-29.tar.gz", backup["reason"])
+
+    def test_missing_essential_member_fails(self):
+        path = self.complete_backup(
+            members=("opt/neo-health/health.db", "etc/fstab"),
+        )
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+        self.assertEqual(backup["gzip_ok"], 1)
+        self.assertEqual(backup["sha256_ok"], 1)
+        self.assertIn(
+            "home/jc/thingsboard/docker-compose.yml", backup["reason"]
+        )
+        self.assertIn("notification_state.db", backup["reason"])
+        self.assertTrue(os.path.isfile(path))
+
+    def test_prefixed_members_are_accepted(self):
+        path = self.complete_backup(
+            members=tuple(f"./{member}" for member in self.MEMBERS),
+        )
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "ok")
+        self.assertTrue(os.path.isfile(path))
+
+
+    def test_essential_member_as_directory_is_not_accepted(self):
+        target = "opt/neo-health/health.db"
+
+        entries = [
+            {"name": member}
+            for member in self.MEMBERS
+            if member != target
+        ]
+        entries.append({"name": target + "/", "type": tarfile.DIRTYPE})
+
+        path = self.make_raw_backup(entries)
+        self.write_checksum(path)
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+        self.assertEqual(backup["gzip_ok"], 1)
+        self.assertEqual(backup["sha256_ok"], 1)
+        self.assertIn(target, backup["reason"])
+
+    def test_essential_member_as_symlink_is_not_accepted(self):
+        target = "home/jc/thingsboard/docker-compose.yml"
+
+        entries = [
+            {"name": member}
+            for member in self.MEMBERS
+            if member != target
+        ]
+        entries.append({
+            "name": target,
+            "type": tarfile.SYMTYPE,
+            "linkname": "/etc/passwd",
+        })
+
+        path = self.make_raw_backup(entries)
+        self.write_checksum(path)
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+        self.assertEqual(backup["gzip_ok"], 1)
+        self.assertEqual(backup["sha256_ok"], 1)
+        self.assertIn(target, backup["reason"])
+
+    # ---------------------------------------------------------
+    # Ausência e indisponibilidade
+    # ---------------------------------------------------------
+
+    def test_absent_backup_is_missing(self):
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "missing")
+        self.assertIsNone(backup["artifact"])
+        self.assertIsNone(backup["gzip_ok"])
+        self.assertIn("nenhum", backup["reason"])
+
+    def test_backup_older_than_six_hours_is_missing(self):
+        path = self.complete_backup()
+        old = time.time() - (neo_health.BACKUP_MAX_AGE_HOURS + 1) * 3600
+        os.utime(path, (old, old))
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "missing")
+        self.assertGreater(
+            backup["age_hours"], neo_health.BACKUP_MAX_AGE_HOURS
+        )
+        self.assertIsNone(backup["gzip_ok"])
+
+    def test_absent_directory_on_mounted_volume_is_missing(self):
+        """Volume montado e diretório ainda inexistente: ausência, não falha."""
+        backup = neo_health.collect_system_backup(
+            os.path.join(self.temp_dir.name, "inexistente")
+        )
+
+        self.assertEqual(backup["status"], "missing")
+        self.assertIsNone(backup["artifact"])
+        self.assertIsNone(backup["gzip_ok"])
+        self.assertIn("ausente", backup["reason"])
+
+    def test_absent_directory_on_unmounted_volume_stays_unavailable(self):
+        """Sem o volume, nada se afirma: a classificação é indisponibilidade."""
+        with patch.object(
+            neo_health, "backup_volume_is_mounted", return_value=False
+        ):
+            backup = neo_health.collect_system_backup(
+                os.path.join(self.temp_dir.name, "inexistente")
+            )
+
+        self.assertEqual(backup["status"], "unavailable")
+        self.assertIn("montado", backup["reason"])
+
+    def test_inaccessible_directory_is_unavailable(self):
+        """Diretório existente, mas ilegível: indisponibilidade, não ausência."""
+        self.assertTrue(os.path.isdir(self.backup_dir))
+
+        with patch.object(
+            neo_health.os, "listdir", side_effect=PermissionError("negado")
+        ):
+            backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "unavailable")
+        self.assertIn("inacessível", backup["reason"])
+
+    def test_unmounted_volume_is_unavailable(self):
+        self.complete_backup()
+
+        with patch.object(
+            neo_health, "backup_volume_is_mounted", return_value=False
+        ):
+            backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "unavailable")
+        self.assertIn("montado", backup["reason"])
+
+    # ---------------------------------------------------------
+    # Seleção do artefato
+    # ---------------------------------------------------------
+
+    def test_checksum_file_is_never_the_artifact(self):
+        path = self.complete_backup()
+
+        backups = neo_health.get_system_backups(self.backup_dir)
+
+        self.assertEqual(backups["count"], 1)
+        self.assertTrue(backups["latest"].endswith(".tar.gz"))
+        self.assertEqual(backups["latest"], path)
+
+    def test_latest_artifact_is_chosen(self):
+        self.complete_backup(
+            name="neo-system_2026-10-29.tar.gz",
+            mtime=time.time() - 3 * 3600,
+        )
+        newer = self.complete_backup(name="neo-system_2026-10-30.tar.gz")
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "ok")
+        self.assertEqual(backup["artifact"], os.path.basename(newer))
+
+
+    # ---------------------------------------------------------
+    # Migração do schema
+    # ---------------------------------------------------------
+
+    def test_legacy_database_receives_new_columns(self):
+        # Schema de produção imediatamente anterior a esta mudança: todas
+        # as colunas exceto as oito do backup do sistema.
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """CREATE TABLE health (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    load_1m REAL, load_5m REAL, load_15m REAL,
+                    memory_used_mb INTEGER, memory_percent REAL,
+                    cpu_temp REAL, nvme_temp REAL,
+                    root_used_percent REAL, root_free_bytes INTEGER,
+                    updates_available INTEGER,
+                    tb_memory_mb REAL, pg_memory_mb REAL,
+                    tb_database_mb REAL, pg_volume_mb REAL,
+                    collection_status TEXT NOT NULL DEFAULT 'ok',
+                    missing_components TEXT,
+                    updates_important INTEGER
+                )"""
+            )
+            conn.execute(
+                "INSERT INTO health (timestamp, load_1m) "
+                "VALUES ('2026-09-01T00:00:00', 0.5)"
+            )
+
+        self.complete_backup()
+
+        health = sample()
+        health["system_backup"] = neo_health.collect_system_backup(
+            self.backup_dir
+        )
+
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        placeholders = ", ".join(self.BACKUP_COLUMNS)
+
+        with sqlite3.connect(self.db_path) as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(health)")
+            }
+            legacy = conn.execute(
+                f"SELECT {placeholders} FROM health WHERE id = 1"
+            ).fetchone()
+            count = conn.execute("SELECT COUNT(*) FROM health").fetchone()[0]
+
+        for name in self.BACKUP_COLUMNS:
+            self.assertIn(name, columns)
+
+        # O registro existente é preservado e permanece "não verificado".
+        self.assertEqual(legacy, (None,) * len(self.BACKUP_COLUMNS))
+        self.assertEqual(count, 2)
+
+    def test_migration_is_idempotent(self):
+        self.complete_backup()
+
+        for _ in range(3):
+            health = sample()
+            health["system_backup"] = neo_health.collect_system_backup(
+                self.backup_dir
+            )
+            self.assertEqual(
+                neo_health.finalize_collection(health, True, self.db_path),
+                0,
+            )
+
+        with sqlite3.connect(self.db_path) as conn:
+            columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(health)")
+            ]
+            count = conn.execute("SELECT COUNT(*) FROM health").fetchone()[0]
+
+        for name in self.BACKUP_COLUMNS:
+            self.assertEqual(columns.count(name), 1)
+
+        self.assertEqual(count, 3)
+
+    # ---------------------------------------------------------
+    # A coleta não depende do backup
+    # ---------------------------------------------------------
+
+    def test_backup_failure_does_not_interrupt_collection(self):
+        # Diretório vazio: o backup está ausente.
+        backup = neo_health.collect_system_backup(self.backup_dir)
+        self.assertEqual(backup["status"], "missing")
+
+        health = sample()
+        health["system_backup"] = backup
+
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        with sqlite3.connect(self.db_path) as conn:
+            status, missing, backup_status = conn.execute(
+                "SELECT collection_status, missing_components, backup_status "
+                "FROM health"
+            ).fetchone()
+
+        self.assertEqual(status, "ok")
+        self.assertIsNone(missing)
+        self.assertEqual(backup_status, "missing")
+
+    def test_backup_state_does_not_change_collection_semantics(self):
+        component = {"ports": {"status": "failed", "reason": "ss indisponível"}}
+
+        health = sample("partial", component)
+        health["system_backup"] = neo_health.collect_system_backup(
+            self.backup_dir
+        )
+
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        # O estado parcial vem do componente de coleta, nunca do backup.
+        self.assertEqual(health["collection_status"], "partial")
+        self.assertNotIn("backup", health["missing_components"])
+        self.assertNotIn("system_backup", health["missing_components"])
+
+        with sqlite3.connect(self.db_path) as conn:
+            status, missing = conn.execute(
+                "SELECT collection_status, missing_components FROM health"
+            ).fetchone()
+
+        self.assertEqual(status, "partial")
+        self.assertEqual(json.loads(missing), component)
+
+    def test_collection_without_backup_information_stays_null(self):
+        health = sample()
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        self.assertEqual(self.persisted_backup(), (None,) * 8)
 
 
 if __name__ == "__main__":
