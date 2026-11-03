@@ -448,6 +448,42 @@ class CollectionValidityTests(unittest.TestCase):
         self.assertIsNone(details)
 
 
+    def test_persist_backup_check_failure_does_not_interrupt_collection(self):
+        stderr = io.StringIO()
+
+        with patch.object(
+            neo_health,
+            "persist_system_backup_check",
+            side_effect=sqlite3.OperationalError("disco cheio"),
+        ):
+            with contextlib.redirect_stderr(stderr):
+                result, output = self.run_collection()
+
+        self.assertEqual(result, 0)
+        self.assertIn("backup do sistema", stderr.getvalue())
+        (status,) = self.last_row(["collection_status"])
+        self.assertEqual(status, "ok")
+
+    def test_essential_failure_before_verification_leaves_no_record(self):
+        with patch.object(
+            neo_health, "get_memory", side_effect=RuntimeError("sem memória")
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(RuntimeError):
+                    neo_health.main(save=True, db_path=self.db_path)
+
+        # Nenhuma verificação artificial: a tabela pode nem existir ainda.
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM system_backup_checks"
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                count = 0
+
+        self.assertEqual(count, 0)
+
+
 class MissingComponentsPresentationTests(unittest.TestCase):
     """A coleta parcial vira texto legível, sem JSON interno."""
 
@@ -896,7 +932,10 @@ class SystemBackupTests(unittest.TestCase):
         self.assertEqual(backup["gzip_ok"], 1)
         # A comparação foi feita e não corresponde: 0, nunca NULL.
         self.assertEqual(backup["sha256_ok"], 0)
-        self.assertIn("neo-system_2026-10-29.tar.gz", backup["reason"])
+        # A categoria da falha é preservada; o nome do outro arquivo não
+        # é exposto na mensagem sanitizada.
+        self.assertEqual(backup["reason"], "checksum refere outro arquivo")
+        self.assertNotIn("neo-system_2026-10-29.tar.gz", backup["reason"])
 
     def test_missing_essential_member_fails(self):
         path = self.complete_backup(
@@ -908,10 +947,12 @@ class SystemBackupTests(unittest.TestCase):
         self.assertEqual(backup["status"], "failed")
         self.assertEqual(backup["gzip_ok"], 1)
         self.assertEqual(backup["sha256_ok"], 1)
-        self.assertIn(
-            "home/jc/thingsboard/docker-compose.yml", backup["reason"]
-        )
+        # Só o último segmento de cada membro essencial: identifica o
+        # componente ausente sem expor a árvore de diretórios do TAR.
+        self.assertIn("docker-compose.yml", backup["reason"])
         self.assertIn("notification_state.db", backup["reason"])
+        self.assertNotIn("home/jc/thingsboard", backup["reason"])
+        self.assertNotIn("opt/neo-analysis", backup["reason"])
         self.assertTrue(os.path.isfile(path))
 
     def test_prefixed_members_are_accepted(self):
@@ -943,7 +984,8 @@ class SystemBackupTests(unittest.TestCase):
         self.assertEqual(backup["status"], "failed")
         self.assertEqual(backup["gzip_ok"], 1)
         self.assertEqual(backup["sha256_ok"], 1)
-        self.assertIn(target, backup["reason"])
+        self.assertIn("health.db", backup["reason"])
+        self.assertNotIn(target, backup["reason"])
 
     def test_essential_member_as_symlink_is_not_accepted(self):
         target = "home/jc/thingsboard/docker-compose.yml"
@@ -967,7 +1009,8 @@ class SystemBackupTests(unittest.TestCase):
         self.assertEqual(backup["status"], "failed")
         self.assertEqual(backup["gzip_ok"], 1)
         self.assertEqual(backup["sha256_ok"], 1)
-        self.assertIn(target, backup["reason"])
+        self.assertIn("docker-compose.yml", backup["reason"])
+        self.assertNotIn(target, backup["reason"])
 
     # ---------------------------------------------------------
     # Ausência e indisponibilidade
@@ -1028,6 +1071,10 @@ class SystemBackupTests(unittest.TestCase):
 
         self.assertEqual(backup["status"], "unavailable")
         self.assertIn("inacessível", backup["reason"])
+        # B2: o caminho absoluto do diretório não é exposto.
+        self.assertEqual(backup["reason"], "diretório de backup inacessível")
+        self.assertNotIn(self.backup_dir, backup["reason"])
+        self.assertNotIn("/", backup["reason"])
 
     def test_unmounted_volume_is_unavailable(self):
         self.complete_backup()
@@ -1206,6 +1253,485 @@ class SystemBackupTests(unittest.TestCase):
         )
 
         self.assertEqual(self.persisted_backup(), (None,) * 8)
+
+
+class BackupReasonSanitizationTests(unittest.TestCase):
+    """B2 — os motivos de backup não expõem caminhos internos."""
+
+    def test_absolute_unix_path_is_reduced_to_its_last_segment(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "diretório de backup inacessível: /mnt/neo-backup/neo-system"
+            ),
+            "diretório de backup inacessível: neo-system",
+        )
+
+    def test_absolute_windows_path_is_reduced_to_its_last_segment(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                r"artefato ausente: C:\Users\jc\backup\neo-system.tar.gz"
+            ),
+            "artefato ausente: neo-system.tar.gz",
+        )
+
+    def test_unc_path_is_reduced_to_its_last_segment(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                r"\\servidor\share\neo-system.tar.gz"
+            ),
+            "neo-system.tar.gz",
+        )
+
+    def test_tar_member_paths_keep_only_the_component_name(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "conteúdo essencial ausente: opt/neo-health/health.db, "
+                "opt/neo-analysis/notification_state.db"
+            ),
+            "conteúdo essencial ausente: health.db, notification_state.db",
+        )
+
+    def test_neutral_reasons_are_preserved(self):
+        for reason in (
+            "SHA-256 divergente",
+            "backup corrompido (gzip)",
+            "backup corrompido (tar)",
+            "volume de backup não está montado",
+            "checksum refere outro arquivo",
+            "backup mais recente há 27h",
+            "diretório de backup ausente",
+            "nenhum backup encontrado",
+        ):
+            self.assertEqual(
+                neo_health.sanitize_backup_reason(reason), reason
+            )
+
+    def test_parenthesised_slash_is_not_destroyed(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason("backup corrompido (gzip/tar)"),
+            "backup corrompido (gzip/tar)",
+        )
+
+    def test_absent_optional_reason_is_none(self):
+        self.assertIsNone(neo_health.sanitize_backup_reason(None))
+        self.assertIsNone(neo_health.sanitize_backup_reason("   "))
+
+    def test_whitespace_is_collapsed_and_length_is_limited(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason("  SHA-256 \n divergente  "),
+            "SHA-256 divergente",
+        )
+
+        long = "x" * (neo_health.MAX_BACKUP_REASON_LENGTH + 50)
+        self.assertEqual(
+            len(neo_health.sanitize_backup_reason(long)),
+            neo_health.MAX_BACKUP_REASON_LENGTH + 1,
+        )
+
+    def test_backup_path_basename_handles_both_separators(self):
+        self.assertEqual(
+            neo_health.backup_path_basename("/mnt/neo-backup/neo-system"),
+            "neo-system",
+        )
+        self.assertEqual(
+            neo_health.backup_path_basename(r"C:\Users\jc\backup\x.tar.gz"),
+            "x.tar.gz",
+        )
+        self.assertEqual(neo_health.backup_path_basename(""), "")
+
+    def test_unix_path_with_spaced_directory_keeps_only_the_last_segment(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "/mnt/backup externo/arquivo.tar.gz"
+            ),
+            "arquivo.tar.gz",
+        )
+
+    def test_unix_path_with_spaced_intermediate_directory(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "/media/backup Neo/neo-system/arquivo.tar.gz"
+            ),
+            "arquivo.tar.gz",
+        )
+
+    def test_windows_path_with_accented_spaced_directory(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                r"C:\Users\João Campos\backup\arquivo.tar.gz"
+            ),
+            "arquivo.tar.gz",
+        )
+
+    def test_consecutive_spaces_in_directory_name_are_handled(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "/mnt/backup  externo/arquivo.tar.gz"
+            ),
+            "arquivo.tar.gz",
+        )
+
+    def test_space_in_first_directory_after_absolute_prefix(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "/backup externo/arquivo.tar.gz"
+            ),
+            "arquivo.tar.gz",
+        )
+
+    def test_spaced_unc_path_keeps_only_the_last_segment(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                r"\\servidor\share Neo\arquivo.tar.gz"
+            ),
+            "arquivo.tar.gz",
+        )
+
+    def test_spaced_path_preserves_leading_prose(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "diretório de backup inacessível: "
+                "/mnt/backup externo/arquivo.tar.gz"
+            ),
+            "diretório de backup inacessível: arquivo.tar.gz",
+        )
+
+    def test_spaced_path_preserves_trailing_prose(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "falha ao ler /mnt/a b/c.tar.gz: permissão negada"
+            ),
+            "falha ao ler c.tar.gz: permissão negada",
+        )
+
+    def test_relative_member_with_spaced_directory_keeps_the_component(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "conteúdo essencial ausente: opt/backup antigo/health.db"
+            ),
+            "conteúdo essencial ausente: health.db",
+        )
+
+    def test_spaced_path_does_not_destroy_parenthesised_phrase(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "backup corrompido (gzip/tar) em /mnt/a b/c.tar.gz"
+            ),
+            "backup corrompido (gzip/tar) em c.tar.gz",
+        )
+
+    def test_slash_expression_e_ou_is_preserved(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "falha em e/ou durante a verificação"
+            ),
+            "falha em e/ou durante a verificação",
+        )
+
+    def test_slash_expression_tcp_ip_is_preserved(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "protocolo TCP/IP indisponível"
+            ),
+            "protocolo TCP/IP indisponível",
+        )
+
+    def test_slash_expression_entrada_saida_is_preserved(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason("entrada/saída inválida"),
+            "entrada/saída inválida",
+        )
+
+    def test_slash_expression_leitura_escrita_is_preserved(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "leitura/escrita não disponível"
+            ),
+            "leitura/escrita não disponível",
+        )
+
+    def test_numeric_slash_expression_is_preserved(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason(
+                "protocolo HTTP/1.1 indisponível"
+            ),
+            "protocolo HTTP/1.1 indisponível",
+        )
+
+    def test_two_segment_relative_path_with_extension_is_recognized(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason("backup/arquivo.tar.gz"),
+            "arquivo.tar.gz",
+        )
+
+    def test_relative_path_under_known_root_without_extension(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason("etc/fstab"), "fstab"
+        )
+
+    def test_relative_path_with_three_segments_is_recognized(self):
+        self.assertEqual(
+            neo_health.sanitize_backup_reason("custom/dir/neo.conf"),
+            "neo.conf",
+        )
+
+
+class SystemBackupChecksPersistenceTests(unittest.TestCase):
+    """M2 — persistência independente e fonte canônica das verificações."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.db_path = os.path.join(self.temp_dir.name, "health.db")
+
+        # Sem o volume montado, a verificação é 'unavailable' e nenhum
+        # caminho real é acessado.
+        mounted = patch.object(
+            neo_health, "backup_volume_is_mounted", return_value=False,
+        )
+        mounted.start()
+        self.addCleanup(mounted.stop)
+
+    # ---------------------------------------------------------
+    # Apoio
+    # ---------------------------------------------------------
+
+    def checks(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM system_backup_checks ORDER BY id"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
+
+    def verify(self, **overrides):
+        """Resultado de verificação controlado (volume não montado)."""
+        backup = neo_health.collect_system_backup(
+            os.path.join(self.temp_dir.name, "inexistente")
+        )
+        backup.update(overrides)
+        return backup
+
+    def create_legacy_health(self, rows):
+        """Banco legado com as colunas de backup e as linhas informadas."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """CREATE TABLE health (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    backup_status TEXT, backup_artifact TEXT,
+                    backup_size_bytes INTEGER, backup_age_hours REAL,
+                    backup_gzip_ok INTEGER, backup_sha256_ok INTEGER,
+                    backup_sha256 TEXT, backup_reason TEXT
+                )"""
+            )
+            for row in rows:
+                columns = ", ".join(row)
+                placeholders = ", ".join(f":{name}" for name in row)
+                conn.execute(
+                    f"INSERT INTO health ({columns}) VALUES ({placeholders})",
+                    row,
+                )
+
+    # ---------------------------------------------------------
+    # Tabela e idempotência
+    # ---------------------------------------------------------
+
+    def test_table_creation_is_idempotent(self):
+        with sqlite3.connect(self.db_path) as conn:
+            neo_health.initialize_health_schema(conn)
+            neo_health.initialize_health_schema(conn)
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(system_backup_checks)"
+                )
+            }
+
+        self.assertEqual(
+            columns,
+            {
+                "id", "verification_id", "timestamp", "status", "artifact",
+                "size_bytes", "age_hours", "gzip_ok", "sha256_ok", "sha256",
+                "reason", "health_id",
+            },
+        )
+
+    def test_repeated_persistence_with_same_id_does_not_duplicate(self):
+        backup = self.verify(status="ok")
+
+        for _ in range(3):
+            neo_health.persist_system_backup_check(
+                backup, db_path=self.db_path
+            )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["verification_id"], backup["verification_id"])
+
+    def test_two_legitimate_checks_of_the_same_artifact_are_distinct(self):
+        first = self.verify(status="ok", artifact="neo-system_20261101.tar.gz")
+        second = self.verify(status="ok", artifact="neo-system_20261101.tar.gz")
+
+        neo_health.persist_system_backup_check(first, db_path=self.db_path)
+        neo_health.persist_system_backup_check(second, db_path=self.db_path)
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["artifact"], rows[1]["artifact"])
+        self.assertNotEqual(
+            rows[0]["verification_id"], rows[1]["verification_id"]
+        )
+
+    # ---------------------------------------------------------
+    # Associação com a coleta
+    # ---------------------------------------------------------
+
+    def test_successful_collection_links_the_check(self):
+        backup = self.verify(status="ok")
+        neo_health.persist_system_backup_check(backup, db_path=self.db_path)
+
+        health = sample()
+        health["system_backup"] = backup
+
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+
+        with sqlite3.connect(self.db_path) as conn:
+            health_id = conn.execute(
+                "SELECT id FROM health ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+
+        self.assertEqual(rows[0]["health_id"], health_id)
+
+    def test_essential_failure_keeps_the_check_without_health_link(self):
+        backup = self.verify(status="failed", reason="SHA-256 divergente")
+        neo_health.persist_system_backup_check(backup, db_path=self.db_path)
+
+        health = sample()
+        health["system_backup"] = backup
+        health["system"]["load"] = None
+
+        with self.assertRaises(RuntimeError):
+            neo_health.finalize_collection(health, True, self.db_path)
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "failed")
+        self.assertEqual(rows[0]["reason"], "SHA-256 divergente")
+        self.assertIsNone(rows[0]["health_id"])
+
+    def test_save_health_creates_the_check_without_independent_persist(self):
+        backup = self.verify(status="missing", reason="nenhum backup encontrado")
+
+        health = sample()
+        health["system_backup"] = backup
+
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "missing")
+        self.assertIsNotNone(rows[0]["health_id"])
+
+    # ---------------------------------------------------------
+    # Migração do histórico
+    # ---------------------------------------------------------
+
+    def test_legacy_history_is_migrated_preserving_metadata(self):
+        self.create_legacy_health([
+            {
+                "timestamp": "2026-10-30T07:30:00",
+                "backup_status": "failed",
+                "backup_reason": "SHA-256 divergente",
+                "backup_artifact": "neo-system_20261030.tar.gz",
+                "backup_size_bytes": 1234,
+                "backup_gzip_ok": 1,
+                "backup_sha256_ok": 0,
+            },
+            {"timestamp": "2026-10-31T07:30:00", "backup_status": None},
+            {
+                "timestamp": "2026-11-01T07:30:00",
+                "backup_status": "ok",
+                "backup_artifact": "neo-system_20261101.tar.gz",
+            },
+        ])
+
+        with sqlite3.connect(self.db_path) as conn:
+            neo_health.initialize_health_schema(conn)
+
+        rows = self.checks()
+        self.assertEqual([row["status"] for row in rows], ["failed", "ok"])
+        self.assertEqual([row["health_id"] for row in rows], [1, 3])
+        self.assertEqual(rows[0]["verification_id"], "legacy-1")
+        self.assertEqual(rows[0]["reason"], "SHA-256 divergente")
+        self.assertEqual(rows[0]["artifact"], "neo-system_20261030.tar.gz")
+        self.assertEqual(rows[0]["size_bytes"], 1234)
+        self.assertEqual(rows[1]["verification_id"], "legacy-3")
+
+    def test_migration_is_idempotent_and_keeps_health_untouched(self):
+        self.create_legacy_health([
+            {"timestamp": "2026-10-30T07:30:00", "backup_status": "ok"},
+            {"timestamp": "2026-10-31T07:30:00", "backup_status": None},
+        ])
+
+        with sqlite3.connect(self.db_path) as conn:
+            neo_health.initialize_health_schema(conn)
+            neo_health.initialize_health_schema(conn)
+            health_rows = conn.execute(
+                "SELECT id, backup_status FROM health ORDER BY id"
+            ).fetchall()
+
+        self.assertEqual(len(self.checks()), 1)
+        self.assertEqual(health_rows, [(1, "ok"), (2, None)])
+
+    def test_legacy_database_without_backup_columns_migrates_nothing(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "CREATE TABLE health ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "timestamp TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO health (timestamp) VALUES ('2026-10-30T07:30:00')"
+            )
+            neo_health.initialize_health_schema(conn)
+
+        self.assertEqual(self.checks(), [])
+
+    def test_migration_does_not_duplicate_a_linked_check(self):
+        """Coleta já coberta pela fonte canônica não gera registro legado."""
+
+        backup = self.verify(status="ok")
+
+        health = sample()
+        health["system_backup"] = backup
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        # Reexecuta a inicialização (e a migração) várias vezes: a coleta
+        # com verificação vinculada nunca vira um registro 'legacy-<id>'.
+        for _ in range(3):
+            with sqlite3.connect(self.db_path) as conn:
+                neo_health.initialize_health_schema(conn)
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["verification_id"], backup["verification_id"])
+        self.assertEqual(
+            [row["verification_id"] for row in rows],
+            [backup["verification_id"]],
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import argparse
 import json
 import tarfile
+import uuid
 import zlib
 from datetime import datetime
 
@@ -72,6 +74,98 @@ SYSTEM_BACKUP_REQUIRED_MEMBERS = (
 
 # O motivo é persistido e depois exibido: mesmo limite dos demais motivos.
 MAX_BACKUP_REASON_LENGTH = 200
+
+# Identifica um token que se parece com um caminho de arquivo — Unix
+# (/mnt/neo-backup/neo-system), Windows (C:\... ou \\servidor\...) ou um
+# membro de TAR (opt/neo-health/health.db). Exige ao menos um separador, e
+# recusa tokens encostados em parênteses ou em outros caracteres de
+# palavra: assim "(gzip/tar)" e textos sem separador não são tocados.
+#
+# Espaços em nomes de diretório (ex.: "/mnt/backup externo/arquivo.tar.gz"
+# ou "C:\Users\João Campos\backup\arquivo.tar.gz") exigem cuidado: aceitar
+# espaços em QUALQUER segmento faria a expressão engolir a prosa vizinha
+# ("diretório de backup inacessível: ..."). Por isso os espaços só entram
+# em segmentos intermediários — sempre cercados por separadores — e no
+# primeiro segmento quando existe um prefixo absoluto inequívoco (/, C:\
+# ou \\). O primeiro segmento de um caminho relativo e o ÚLTIMO segmento
+# permanecem sem espaços, o que preserva a fronteira com o texto ao redor.
+#
+# Caminhos RELATIVOS são ambíguos: "e/ou", "TCP/IP", "entrada/saída" e
+# "leitura/escrita" têm a mesma forma de "opt/neo-health/health.db". Um
+# token relativo só é tratado como caminho quando é inequivocamente um
+# caminho do sistema de arquivos: começa por uma raiz conhecida, tem 3+
+# segmentos, ou tem 2 segmentos com extensão de arquivo. Assim os membros
+# de TAR continuam reconhecidos e as expressões textuais são preservadas.
+BACKUP_PATH_ROOTS = (
+    "bin|boot|dev|etc|home|lib32|lib64|lib|lost\\+found|media|mnt|opt|"
+    "proc|root|run|sbin|srv|sys|tmp|usr|var"
+)
+
+BACKUP_PATH_TOKEN = re.compile(
+    rf"""
+    (?<![\w(])                                 # não encosta em palavra nem '('
+    (?:
+        (?:
+            [A-Za-z]:[\\/]                     # prefixo de unidade (C:\)
+          | \\\\                               # prefixo UNC (\\servidor)
+          | /                                  # prefixo Unix absoluto
+        )
+        [\w.\-]+(?:\s+[\w.\-]+)*               # 1º segmento (pode ter espaços)
+        (?:[\\/][\w.\-]+(?:\s+[\w.\-]+)*)*     # segmentos intermediários
+        [\\/][\w.\-]+                          # último segmento (sem espaços)
+      |
+        (?:
+            (?:{BACKUP_PATH_ROOTS})[\\/]       # raiz de sistema conhecida
+            (?:[\w.\-]+(?:\s+[\w.\-]+)*[\\/])* # intermediários
+            [\w.\-]+                           # último segmento (sem espaços)
+          |
+            [\w.\-]+                           # 1º segmento relativo
+            (?:[\\/][\w.\-]+(?:\s+[\w.\-]+)*)+ # 2+ intermediários → 3+ segmentos
+            [\\/][\w.\-]+                      # último segmento (sem espaços)
+          |
+            [\w.\-]+[\\/]                      # 2 segmentos, com extensão no
+            [\w.\-]*\.[A-Za-z][\w.\-]*         # ... último (nome de arquivo)
+        )
+    )
+    (?![)\w])                                  # não encosta em ')' nem palavra
+    """,
+    re.VERBOSE,
+)
+
+
+def backup_path_basename(path):
+    """Último segmento de um caminho Unix ou Windows; '' quando não houver.
+
+    Preserva a identidade lógica do componente (o nome do arquivo ou do
+    diretório) sem expor a estrutura de diretórios que o contém.
+    """
+    segments = [
+        segment
+        for segment in str(path).replace("\\", "/").split("/")
+        if segment
+    ]
+
+    return segments[-1] if segments else ""
+
+
+def redact_backup_paths(text):
+    """Reduz caminhos a seu último segmento, sem expor diretórios internos."""
+    return BACKUP_PATH_TOKEN.sub(
+        lambda match: backup_path_basename(match.group(0)), text
+    )
+
+
+# A tabela canônica das verificações de backup. A partir desta fase ela é
+# a fonte de verdade; as colunas backup_* da tabela `health` continuam
+# existindo apenas por compatibilidade com consumidores existentes.
+SYSTEM_BACKUP_CHECKS_TABLE = "system_backup_checks"
+
+# Estados possíveis de uma verificação, na mesma semântica de
+# collect_system_backup(). NULL (não verificado) não é um estado.
+SYSTEM_BACKUP_STATUSES = ("ok", "failed", "missing", "unavailable")
+
+# Prefixo do identificador derivado das linhas históricas migradas.
+LEGACY_VERIFICATION_PREFIX = "legacy-"
 
 # ============================================================
 # Neo Health Check
@@ -323,6 +417,82 @@ def initialize_health_schema(conn):
         conn.execute("ALTER TABLE health ADD COLUMN backup_sha256 TEXT")
     if "backup_reason" not in columns:
         conn.execute("ALTER TABLE health ADD COLUMN backup_reason TEXT")
+
+    # ------------------------------------------------------------
+    # Fonte canônica das verificações de backup do sistema
+    #
+    # A tabela `system_backup_checks` passa a ser a fonte de verdade. As
+    # colunas backup_* de `health` são mantidas apenas por compatibilidade
+    # e não são mais a referência. `verification_id` identifica a EXECUÇÃO
+    # da verificação e é UNIQUE: repetir a persistência da mesma execução
+    # não cria outra linha, enquanto duas verificações legítimas do mesmo
+    # artefato continuam sendo registros distintos. O `id` AUTOINCREMENT é
+    # a sequência determinística de processamento.
+    # ------------------------------------------------------------
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_backup_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            verification_id TEXT NOT NULL UNIQUE,
+            timestamp TEXT NOT NULL,
+            status TEXT,
+            artifact TEXT,
+            size_bytes INTEGER,
+            age_hours REAL,
+            gzip_ok INTEGER,
+            sha256_ok INTEGER,
+            sha256 TEXT,
+            reason TEXT,
+            health_id INTEGER
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS system_backup_checks_health_idx "
+        "ON system_backup_checks(health_id)"
+    )
+    migrate_legacy_backup_checks(conn)
+
+
+def migrate_legacy_backup_checks(conn):
+    """Migra o histórico de health.backup_* para a tabela canônica.
+
+    Executada dentro da inicialização do schema, em transação apropriada:
+    uma interrupção não deixa migração parcial. É idempotente porque o
+    `verification_id` é derivado do id da coleta (`legacy-<id>`), então
+    reexecutar não duplica. Linhas cujo `backup_status` é NULL nunca
+    tiveram verificação: nenhum registro artificial é criado para elas e
+    as linhas originais de `health` permanecem intocadas.
+
+    Linhas que JÁ têm uma verificação canônica vinculada (`health_id`)
+    são ignoradas: a migração é apenas para o histórico anterior, e a
+    mesma coleta nunca aparece duas vezes na tabela canônica.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(health)")}
+
+    if "backup_status" not in columns:
+        return 0
+
+    cursor = conn.execute(
+        f"""
+        INSERT OR IGNORE INTO {SYSTEM_BACKUP_CHECKS_TABLE} (
+            verification_id, timestamp, status, artifact, size_bytes,
+            age_hours, gzip_ok, sha256_ok, sha256, reason, health_id
+        )
+        SELECT '{LEGACY_VERIFICATION_PREFIX}' || id, timestamp,
+               backup_status, backup_artifact, backup_size_bytes,
+               backup_age_hours, backup_gzip_ok, backup_sha256_ok,
+               backup_sha256, backup_reason, id
+        FROM health
+        WHERE backup_status IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM {SYSTEM_BACKUP_CHECKS_TABLE}
+              WHERE {SYSTEM_BACKUP_CHECKS_TABLE}.health_id = health.id
+          )
+        """
+    )
+
+    return cursor.rowcount if cursor.rowcount is not None else 0
 
 
 def format_disk_free(kb):
@@ -894,11 +1064,19 @@ def format_size(bytes_size):
 
 
 def sanitize_backup_reason(reason):
-    """Normaliza o motivo, que é persistido e posteriormente exibido."""
+    """Normaliza o motivo, que é persistido e posteriormente exibido.
+
+    Além de colapsar espaços e limitar o tamanho, remove a estrutura de
+    diretórios: caminhos absolutos (Unix ou Windows), membros de TAR e
+    qualquer caminho interno são reduzidos ao último segmento. O motivo
+    continua útil para diagnóstico — a categoria da falha e a identidade
+    lógica do componente permanecem — sem expor caminhos do sistema.
+    """
     if reason is None:
         return None
 
     text = " ".join(str(reason).split())
+    text = redact_backup_paths(text)
 
     if len(text) > MAX_BACKUP_REASON_LENGTH:
         text = text[:MAX_BACKUP_REASON_LENGTH] + "…"
@@ -1104,6 +1282,11 @@ def collect_system_backup(backup_dir=None):
     backup_dir = os.path.expanduser(backup_dir or SYSTEM_BACKUP_DIR)
 
     result = {
+        # Identificador único da EXECUÇÃO. Gerado uma única vez e reusado
+        # em todas as tentativas de persistência desta verificação, de
+        # modo que uma repetição não cria outra linha.
+        "verification_id": str(uuid.uuid4()),
+        "timestamp": datetime.now().isoformat(),
         "status": "unavailable",
         "artifact": None,
         "size_bytes": None,
@@ -1136,8 +1319,10 @@ def collect_system_backup(backup_dir=None):
     if backups is None:
         # O diretório existe (verificado acima) e mesmo assim não pôde ser
         # lido: permissão ou falha de I/O. Nada se afirma sobre o backup.
+        # O caminho NÃO entra no motivo: o diagnóstico útil é a categoria
+        # da falha, não a localização do diretório.
         result["reason"] = sanitize_backup_reason(
-            f"diretório de backup inacessível: {backup_dir}"
+            "diretório de backup inacessível"
         )
         return result
 
@@ -1195,12 +1380,13 @@ def collect_system_backup(backup_dir=None):
 
     # O checksum vale para o arquivo que ele nomeia. Um nome diferente
     # significa que a referência não corresponde ao artefato analisado:
-    # é divergência (0), não ausência (NULL).
+    # é divergência (0), não ausência (NULL). O nome referenciado não é
+    # exposto — o que importa é a categoria da divergência.
     if expected[1] != result["artifact"]:
         result["sha256_ok"] = 0
         result["status"] = "failed"
         result["reason"] = sanitize_backup_reason(
-            f"checksum refere outro arquivo: {expected[1]}"
+            "checksum refere outro arquivo"
         )
         return result
 
@@ -1220,8 +1406,11 @@ def collect_system_backup(backup_dir=None):
 
     if missing:
         result["status"] = "failed"
+        # Só o último segmento de cada membro essencial: identifica o
+        # componente ausente sem reproduzir a árvore de diretórios.
         result["reason"] = sanitize_backup_reason(
-            "conteúdo essencial ausente: " + ", ".join(missing)
+            "conteúdo essencial ausente: "
+            + ", ".join(backup_path_basename(member) for member in missing)
         )
         return result
 
@@ -1328,6 +1517,85 @@ def get_updates():
 
     return parse_upgradable_list(result.stdout)
 
+
+def new_verification_id():
+    """Identificador único e estável de uma execução da verificação."""
+    return str(uuid.uuid4())
+
+
+def _upsert_system_backup_check(
+    conn, verification_id, timestamp, backup, health_id=None
+):
+    """Grava (ou completa) uma verificação na tabela canônica.
+
+    Idempotente por `verification_id`: a repetição da mesma execução não
+    cria outra linha. O `health_id` só é associado quando informado, e
+    nunca é apagado por uma gravação posterior sem vínculo — a verificação
+    independente (coleta essencial malsucedida) permanece com
+    `health_id` NULL até existir uma coleta correspondente.
+    """
+    conn.execute(
+        f"""
+        INSERT INTO {SYSTEM_BACKUP_CHECKS_TABLE} (
+            verification_id, timestamp, status, artifact, size_bytes,
+            age_hours, gzip_ok, sha256_ok, sha256, reason, health_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(verification_id) DO UPDATE SET
+            health_id = COALESCE(
+                excluded.health_id, {SYSTEM_BACKUP_CHECKS_TABLE}.health_id
+            )
+        """,
+        (
+            verification_id,
+            timestamp,
+            backup.get("status"),
+            backup.get("artifact"),
+            backup.get("size_bytes"),
+            backup.get("age_hours"),
+            backup.get("gzip_ok"),
+            backup.get("sha256_ok"),
+            backup.get("sha256"),
+            backup.get("reason"),
+            health_id,
+        ),
+    )
+
+
+def persist_system_backup_check(
+    backup, verification_id=None, health_id=None, db_path=None
+):
+    """Persiste a verificação na fonte canônica, de forma independente.
+
+    Executada imediatamente após collect_system_backup(), antes de
+    finalize_collection: a verificação é preservada mesmo quando a coleta
+    essencial falha depois. Usa conexão e transação próprias e não depende
+    do sucesso da coleta essencial. Devolve o `verification_id` gravado,
+    ou None quando não há verificação a gravar.
+    """
+    if not backup:
+        return None
+
+    verification_id = verification_id or backup.get("verification_id")
+
+    if not verification_id:
+        return None
+
+    timestamp = backup.get("timestamp") or datetime.now().isoformat()
+    db_path = db_path or DB_PATH
+
+    with sqlite3.connect(db_path) as conn:
+        initialize_health_schema(conn)
+        _upsert_system_backup_check(
+            conn,
+            verification_id,
+            timestamp,
+            backup,
+            health_id=health_id,
+        )
+
+    return verification_id
+
+
 def save_health(health, db_path=None):
     """Grava a coleta no histórico do neo-health."""
 
@@ -1421,6 +1689,21 @@ def save_health(health, db_path=None):
         )
 
         health_id = cursor.lastrowid
+
+        # Associa a verificação do backup à coleta, na MESMA transação da
+        # linha de `health`. Se a persistência independente já ocorreu, a
+        # linha canônica é completada com o vínculo; se save_health foi
+        # chamado diretamente, o registro é criado aqui. Idempotente por
+        # `verification_id`: nunca há registro duplicado.
+        if system_backup.get("verification_id"):
+            _upsert_system_backup_check(
+                conn,
+                system_backup["verification_id"],
+                system_backup.get("timestamp")
+                or health["timestamp"].isoformat(),
+                system_backup,
+                health_id=health_id,
+            )
 
         # ----------------------------------------------------
         # Histórico das tabelas PostgreSQL
@@ -1814,6 +2097,8 @@ def main(save=False, db_path=None):
         system_backup = collect_system_backup()
     except Exception as error:  # nunca interrompe a coleta essencial
         system_backup = {
+            "verification_id": new_verification_id(),
+            "timestamp": datetime.now().isoformat(),
             "status": "unavailable",
             "artifact": None,
             "size_bytes": None,
@@ -1827,6 +2112,20 @@ def main(save=False, db_path=None):
         }
 
     print_system_backup(system_backup)
+
+    # Persistência INDEPENDENTE, imediatamente após a verificação e antes
+    # de finalize_collection: a verificação é preservada mesmo quando a
+    # coleta essencial falhar depois. Falha aqui é registrada e nunca
+    # interrompe o workflow nem mascara o erro original da coleta.
+    if save:
+        try:
+            persist_system_backup_check(system_backup, db_path=db_path)
+        except Exception as error:
+            print(
+                "Falha ao persistir a verificação do backup do sistema: "
+                f"{error}",
+                file=sys.stderr,
+            )
 
     # --------------------------------------------------------
     # BACKUP TIMER
