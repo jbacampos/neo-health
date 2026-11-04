@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime
@@ -1939,6 +1940,329 @@ class SystemBackupVerificationIdentityTests(unittest.TestCase):
         rows = self.checks()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["verification_id"], backup["verification_id"])
+
+
+class SqliteRobustnessTests(unittest.TestCase):
+    """E4 — política única de conexão e retry idempotente sob contenção."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.db_path = os.path.join(self.temp_dir.name, "health.db")
+
+        # Sem o volume montado, a verificação é 'unavailable' e nenhum
+        # caminho real é acessado.
+        mounted = patch.object(
+            neo_health, "backup_volume_is_mounted", return_value=False,
+        )
+        mounted.start()
+        self.addCleanup(mounted.stop)
+
+    def verify(self, **overrides):
+        backup = neo_health.collect_system_backup(
+            os.path.join(self.temp_dir.name, "inexistente")
+        )
+        backup.update(overrides)
+        return backup
+
+    def checks(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM system_backup_checks ORDER BY id"
+                )
+            ]
+
+    # ---------------------------------------------------------
+    # Conexão
+    # ---------------------------------------------------------
+
+    def test_connect_health_db_sets_busy_timeout_and_keeps_delete_full(self):
+        conn = neo_health.connect_health_db(self.db_path)
+        self.addCleanup(conn.close)
+
+        self.assertEqual(
+            conn.execute("PRAGMA busy_timeout").fetchone()[0], 30000
+        )
+        self.assertEqual(
+            conn.execute("PRAGMA journal_mode").fetchone()[0], "delete"
+        )
+        self.assertEqual(conn.execute("PRAGMA synchronous").fetchone()[0], 2)
+
+    def test_real_writes_keep_journal_delete_and_synchronous_full(self):
+        health = sample()
+        health["system_backup"] = self.verify(status="ok")
+        neo_health.finalize_collection(health, True, self.db_path)
+
+        with sqlite3.connect(self.db_path) as conn:
+            self.assertEqual(
+                conn.execute("PRAGMA journal_mode").fetchone()[0], "delete"
+            )
+            self.assertEqual(
+                conn.execute("PRAGMA synchronous").fetchone()[0], 2
+            )
+
+    # ---------------------------------------------------------
+    # Detecção de contenção
+    # ---------------------------------------------------------
+
+    def test_is_contention_error_distinguishes_locked_and_busy(self):
+        self.assertTrue(
+            neo_health.is_contention_error(
+                sqlite3.OperationalError("database is locked")
+            )
+        )
+        self.assertTrue(
+            neo_health.is_contention_error(
+                sqlite3.OperationalError("database is busy")
+            )
+        )
+        self.assertFalse(
+            neo_health.is_contention_error(
+                sqlite3.OperationalError("no such table: health")
+            )
+        )
+        self.assertFalse(
+            neo_health.is_contention_error(ValueError("database is locked"))
+        )
+
+    # ---------------------------------------------------------
+    # Retry limitado
+    # ---------------------------------------------------------
+
+    def test_run_with_retry_succeeds_after_transient_contention(self):
+        calls = {"count": 0}
+
+        def operation():
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return "ok"
+
+        result = neo_health.run_with_retry(
+            operation, description="teste", base_delay=0, max_delay=0,
+        )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls["count"], 3)
+
+    def test_run_with_retry_propagates_non_contention_immediately(self):
+        calls = {"count": 0}
+
+        def operation():
+            calls["count"] += 1
+            raise sqlite3.OperationalError("no such table: health")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            neo_health.run_with_retry(
+                operation, description="teste", base_delay=0, max_delay=0,
+            )
+
+        self.assertEqual(calls["count"], 1)
+
+    def test_run_with_retry_raises_clear_error_when_exhausted(self):
+        calls = {"count": 0}
+
+        def operation():
+            calls["count"] += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        with self.assertRaises(sqlite3.OperationalError) as context:
+            neo_health.run_with_retry(
+                operation, description="gravar a verificação", attempts=3,
+                base_delay=0, max_delay=0,
+            )
+
+        self.assertIn("gravar a verificação", str(context.exception))
+        self.assertIn("3 tentativas", str(context.exception))
+        self.assertEqual(calls["count"], 3)
+
+    # ---------------------------------------------------------
+    # Idempotência do retry
+    # ---------------------------------------------------------
+
+    def test_persist_retries_contention_without_duplication(self):
+        backup = self.verify(status="ok")
+        real = neo_health._upsert_system_backup_check
+        calls = {"count": 0}
+
+        def flaky(conn, *args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real(conn, *args, **kwargs)
+
+        with patch.object(
+            neo_health, "_upsert_system_backup_check", flaky,
+        ), patch.object(neo_health, "DB_RETRY_BASE_DELAY", 0):
+            neo_health.persist_system_backup_check(
+                backup, db_path=self.db_path,
+            )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["verification_id"], backup["verification_id"])
+        self.assertEqual(calls["count"], 2)
+
+    def test_persist_does_not_retry_non_contention_error(self):
+        backup = self.verify(status="ok")
+
+        with patch.object(
+            neo_health,
+            "_upsert_system_backup_check",
+            side_effect=sqlite3.OperationalError("no such table: health"),
+        ) as upsert:
+            with self.assertRaises(sqlite3.OperationalError):
+                neo_health.persist_system_backup_check(
+                    backup, db_path=self.db_path,
+                )
+
+        self.assertEqual(upsert.call_count, 1)
+
+    def test_save_health_does_not_retry(self):
+        """`INSERT INTO health` não é idempotente: nunca é repetido."""
+
+        health = sample()
+
+        with patch.object(
+            neo_health,
+            "initialize_health_schema",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ) as initialize:
+            with self.assertRaises(sqlite3.OperationalError):
+                neo_health.save_health(health, self.db_path)
+
+        self.assertEqual(initialize.call_count, 1)
+
+    # ---------------------------------------------------------
+    # Fechamento das conexões
+    # ---------------------------------------------------------
+
+    def test_health_db_connection_is_closed_on_exit(self):
+        with neo_health.health_db_connection(self.db_path) as conn:
+            conn.execute("SELECT 1")
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+    # ---------------------------------------------------------
+    # Contenção REAL (lock do SQLite, sem simular OperationalError)
+    # ---------------------------------------------------------
+
+    def test_persist_waits_for_a_real_write_lock(self):
+        """Contenção REAL: a instrução de escrita de B só conclui após A
+        liberar o lock. A confirmação usa o trace do SQLite (B chegou À
+        INSTRUÇÃO de escrita), não um sinal anterior à chamada.
+        """
+
+        backup = self.verify(status="ok")
+
+        setup = neo_health.connect_health_db(self.db_path)
+        neo_health.initialize_health_schema(setup)
+        setup.close()
+
+        # Conexão A retém um lock de ESCRITA real.
+        holder = neo_health.connect_health_db(self.db_path)
+        holder.isolation_level = None
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute(
+            "INSERT INTO health (timestamp) VALUES ('2026-11-01T07:30:00')"
+        )
+
+        attempted = threading.Event()
+        finished = threading.Event()
+        outcome = {}
+
+        def on_statement(statement):
+            """Sinaliza a instrução de escrita do UPSERT em system_backup_checks.
+
+            Reconhece especificamente o `INSERT INTO system_backup_checks`
+            usado por `_upsert_system_backup_check` — e NÃO a migração, que
+            usa `INSERT OR IGNORE INTO system_backup_checks`.
+            """
+
+            normalized = " ".join(statement.split()).upper()
+
+            if normalized.startswith("INSERT INTO SYSTEM_BACKUP_CHECKS"):
+                attempted.set()
+
+        real_connect = neo_health.connect_health_db
+
+        def traced_connect(db_path):
+            conn = real_connect(db_path)
+            conn.set_trace_callback(on_statement)
+            return conn
+
+        def run():
+            try:
+                outcome["id"] = neo_health.persist_system_backup_check(
+                    backup, db_path=self.db_path,
+                )
+            except Exception as error:  # reportado no assert
+                outcome["error"] = error
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run, daemon=True)
+
+        try:
+            # A migração legada é ISOLADA neste fixture: não há linhas
+            # legadas e ela executaria outro INSERT em system_backup_checks
+            # (bloqueado ANTES do upsert), impedindo que a tentativa
+            # sinalizada seja exatamente a instrução do upsert.
+            with patch.object(
+                neo_health, "migrate_legacy_backup_checks", lambda conn: 0,
+            ), patch.object(
+                neo_health, "connect_health_db", traced_connect,
+            ), patch.object(
+                neo_health, "DB_BUSY_TIMEOUT_MS", 5000,
+            ), patch.object(neo_health, "DB_RETRY_BASE_DELAY", 0):
+                worker.start()
+
+                # (3) B chegou à INSTRUÇÃO de escrita do upsert (trace)...
+                self.assertTrue(attempted.wait(timeout=5))
+                # (4) ...e, com o lock retido, ainda NÃO concluiu.
+                self.assertFalse(finished.wait(timeout=0.5))
+
+                # (5) libera o lock de A.
+                holder.commit()
+
+                # (6) B conclui.
+                self.assertTrue(finished.wait(timeout=10))
+        finally:
+            # Libera o lock e encerra a thread mesmo em caso de falha.
+            try:
+                holder.commit()
+            except sqlite3.Error:
+                pass
+            holder.close()
+
+            worker.join(timeout=10)
+
+            if worker.is_alive():
+                self.fail(
+                    "a thread da persistência não terminou após "
+                    "worker.join(10)"
+                )
+
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome["id"], backup["verification_id"])
+
+        # (7) exatamente um registro para o verification_id, sem órfãos.
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["verification_id"], backup["verification_id"])
+
+        with sqlite3.connect(self.db_path) as conn:
+            orphans = conn.execute(
+                "SELECT COUNT(*) FROM system_backup_checks "
+                "WHERE health_id IS NOT NULL "
+                "AND health_id NOT IN (SELECT id FROM health)"
+            ).fetchone()[0]
+
+        self.assertEqual(orphans, 0)
 
 
 if __name__ == "__main__":

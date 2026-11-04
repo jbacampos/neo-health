@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import contextlib
 import os
 import re
 import socket
@@ -11,11 +12,97 @@ import sys
 import argparse
 import json
 import tarfile
+import time
 import uuid
 import zlib
 from datetime import datetime
 
 DB_PATH = "/opt/neo-health/health.db"
+
+# Política única de contenção das conexões ao health.db: sob contenção
+# transitória o SQLite espera em vez de falhar imediatamente. Não altera
+# journal_mode (DELETE) nem synchronous (FULL), que permanecem os padrões.
+DB_BUSY_TIMEOUT_MS = 30000
+
+# Retry limitado, só para operações IDEMPOTENTES sob contenção transitória.
+DB_RETRY_ATTEMPTS = 5
+DB_RETRY_BASE_DELAY = 0.2
+DB_RETRY_MAX_DELAY = 2.0
+
+# Marcadores de contenção transitória do SQLite (lock/busy). Qualquer outro
+# erro operacional NÃO é repetido.
+DB_CONTENTION_MARKERS = ("database is locked", "database is busy")
+
+
+def connect_health_db(db_path):
+    """Abre uma conexão ao health.db com a política única de contenção.
+
+    `timeout` (segundos) e `PRAGMA busy_timeout` (ms) usam o mesmo valor,
+    para que contenção transitória espere em vez de falhar. Cada chamada
+    devolve uma conexão PRÓPRIA — nunca compartilhada entre threads ou
+    processos. `journal_mode` (DELETE) e `synchronous` (FULL) não são
+    alterados.
+    """
+
+    conn = sqlite3.connect(db_path, timeout=DB_BUSY_TIMEOUT_MS / 1000)
+    conn.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+@contextlib.contextmanager
+def health_db_connection(db_path):
+    """Conexão ao health.db que controla a transação E FECHA ao sair.
+
+    `with sqlite3.connect(...)` controla commit/rollback mas NÃO fecha a
+    conexão; este gerenciador garante o fechamento, inclusive em exceção.
+    """
+
+    conn = connect_health_db(db_path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def is_contention_error(error):
+    """Diz se o erro é contenção transitória (locked/busy) do SQLite."""
+
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+
+    message = str(error).lower()
+    return any(marker in message for marker in DB_CONTENTION_MARKERS)
+
+
+def run_with_retry(operation, *, description, attempts=None,
+                   base_delay=None, max_delay=None):
+    """Executa `operation` repetindo SÓ sob contenção transitória.
+
+    `operation` precisa ser IDEMPOTENTE: repetir não pode duplicar efeitos.
+    Erros que não sejam de contenção propagam imediatamente. O backoff é
+    progressivo e limitado. Esgotadas as tentativas, propaga um
+    OperationalError com mensagem clara, encadeando o erro original.
+    """
+
+    attempts = DB_RETRY_ATTEMPTS if attempts is None else attempts
+    base_delay = DB_RETRY_BASE_DELAY if base_delay is None else base_delay
+    max_delay = DB_RETRY_MAX_DELAY if max_delay is None else max_delay
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except sqlite3.OperationalError as error:
+            if not is_contention_error(error):
+                raise
+            if attempt == attempts:
+                raise sqlite3.OperationalError(
+                    f"{description}: banco de dados ocupado após "
+                    f"{attempts} tentativas ({error})"
+                ) from error
+            time.sleep(min(base_delay * (2 ** (attempt - 1)), max_delay))
+
+    raise AssertionError("run_with_retry: estado inalcançável")
 
 # Pocket de segurança do Ubuntu: upgrades vindos daqui são "importantes".
 SECURITY_POCKET_SUFFIX = "-security"
@@ -1625,15 +1712,24 @@ def persist_system_backup_check(
     timestamp = backup.get("timestamp") or datetime.now().isoformat()
     db_path = db_path or DB_PATH
 
-    with sqlite3.connect(db_path) as conn:
-        initialize_health_schema(conn)
-        _upsert_system_backup_check(
-            conn,
-            verification_id,
-            timestamp,
-            backup,
-            health_id=health_id,
-        )
+    def persist():
+        with health_db_connection(db_path) as conn:
+            initialize_health_schema(conn)
+            _upsert_system_backup_check(
+                conn,
+                verification_id,
+                timestamp,
+                backup,
+                health_id=health_id,
+            )
+
+    # Retry SÓ sob contenção: a gravação é idempotente por `verification_id`
+    # (ON CONFLICT DO UPDATE), então repetir não cria linha duplicada. Cada
+    # tentativa abre a PRÓPRIA conexão/transação — falha faz rollback limpo.
+    run_with_retry(
+        persist,
+        description="persistir a verificação do backup do sistema",
+    )
 
     return verification_id
 
@@ -1657,7 +1753,12 @@ def save_health(health, db_path=None):
     # chamadas antigas (testes, uso manual): todas as colunas ficam NULL.
     system_backup = health.get("system_backup") or {}
 
-    with sqlite3.connect(db_path) as conn:
+    # Sem retry: `INSERT INTO health` NÃO é idempotente — repetir criaria uma
+    # coleta duplicada. A contenção transitória é absorvida pelo busy_timeout
+    # da conexão; esgotado o timeout, a falha propaga e a coleta é marcada
+    # como falha (o check de backup já foi preservado pela persistência
+    # independente).
+    with health_db_connection(db_path) as conn:
         initialize_health_schema(conn)
 
         # ----------------------------------------------------
