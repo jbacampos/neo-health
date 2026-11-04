@@ -1278,14 +1278,22 @@ def collect_system_backup(backup_dir=None):
 
     A ausência do arquivo .sha256 não é divergência: é impossibilidade de
     comparar, então backup_sha256_ok fica NULL.
+
+    A identidade da execução é obtida de new_verification_id() uma única
+    vez, no início da verificação, e reusada em todas as persistências
+    desta mesma execução. `verification_id` identifica a EXECUÇÃO
+    individual da verificação — não o componente verificado nem o dia —,
+    de modo que duas execuções legítimas nunca compartilham identificador
+    e repetir a persistência de uma execução permanece idempotente.
     """
     backup_dir = os.path.expanduser(backup_dir or SYSTEM_BACKUP_DIR)
 
     result = {
-        # Identificador único da EXECUÇÃO. Gerado uma única vez e reusado
-        # em todas as tentativas de persistência desta verificação, de
-        # modo que uma repetição não cria outra linha.
-        "verification_id": str(uuid.uuid4()),
+        # Identificador da EXECUÇÃO da verificação, obtido da única
+        # fábrica canônica (new_verification_id()). É gerado uma única vez
+        # por execução e reusado em todos os pontos de persistência desta
+        # verificação, de modo que uma repetição não cria outra linha.
+        "verification_id": new_verification_id(),
         "timestamp": datetime.now().isoformat(),
         "status": "unavailable",
         "artifact": None,
@@ -1519,7 +1527,13 @@ def get_updates():
 
 
 def new_verification_id():
-    """Identificador único e estável de uma execução da verificação."""
+    """Identificador único e estável de uma execução da verificação.
+
+    É a única fábrica do `verification_id`: identifica uma EXECUÇÃO
+    individual da verificação de backup (não um componente nem um dia).
+    Deve ser chamada uma única vez por execução e o valor reusado em
+    todas as persistências daquela mesma execução.
+    """
     return str(uuid.uuid4())
 
 

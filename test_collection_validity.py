@@ -1734,5 +1734,131 @@ class SystemBackupChecksPersistenceTests(unittest.TestCase):
         )
 
 
+class SystemBackupVerificationIdentityTests(unittest.TestCase):
+    """E1 — identidade da verificação: uma execução, um identificador.
+
+    `verification_id` identifica a EXECUÇÃO individual da verificação de
+    backup. Deve vir exclusivamente de new_verification_id(), ser gerado
+    uma única vez por execução e ser reusado em todas as persistências
+    daquela mesma execução.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.db_path = os.path.join(self.temp_dir.name, "health.db")
+
+        # Volume não montado: a verificação é 'unavailable' e nenhum
+        # caminho real do sistema é acessado.
+        mounted = patch.object(
+            neo_health, "backup_volume_is_mounted", return_value=False,
+        )
+        mounted.start()
+        self.addCleanup(mounted.stop)
+
+    # ---------------------------------------------------------
+    # Apoio
+    # ---------------------------------------------------------
+
+    def collect(self):
+        return neo_health.collect_system_backup(
+            os.path.join(self.temp_dir.name, "inexistente")
+        )
+
+    def checks(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM system_backup_checks ORDER BY id"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
+
+    # ---------------------------------------------------------
+    # Origem e unicidade da geração
+    # ---------------------------------------------------------
+
+    def test_collect_uses_new_verification_id(self):
+        sentinel = "e1-sentinel-id"
+
+        with patch.object(
+            neo_health, "new_verification_id", return_value=sentinel
+        ):
+            backup = self.collect()
+
+        self.assertEqual(backup["verification_id"], sentinel)
+
+    def test_generator_is_called_exactly_once_per_execution(self):
+        with patch.object(
+            neo_health,
+            "new_verification_id",
+            wraps=neo_health.new_verification_id,
+        ) as generator:
+            self.collect()
+
+        self.assertEqual(generator.call_count, 1)
+
+    def test_two_executions_produce_different_ids(self):
+        with patch.object(
+            neo_health,
+            "new_verification_id",
+            wraps=neo_health.new_verification_id,
+        ) as generator:
+            first = self.collect()
+            second = self.collect()
+
+        self.assertEqual(generator.call_count, 2)
+        self.assertNotEqual(
+            first["verification_id"], second["verification_id"]
+        )
+
+        neo_health.persist_system_backup_check(first, db_path=self.db_path)
+        neo_health.persist_system_backup_check(second, db_path=self.db_path)
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            sorted(row["verification_id"] for row in rows),
+            sorted([first["verification_id"], second["verification_id"]]),
+        )
+
+    # ---------------------------------------------------------
+    # Reuso e idempotência
+    # ---------------------------------------------------------
+
+    def test_same_id_is_reused_across_persistences_of_one_execution(self):
+        backup = self.collect()
+
+        # Persistência independente e, em seguida, a persistência
+        # vinculada à coleta: ambas referem-se à MESMA execução e devem
+        # convergir para um único registro.
+        neo_health.persist_system_backup_check(backup, db_path=self.db_path)
+
+        health = sample()
+        health["system_backup"] = backup
+        self.assertEqual(
+            neo_health.finalize_collection(health, True, self.db_path), 0
+        )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["verification_id"], backup["verification_id"])
+        self.assertIsNotNone(rows[0]["health_id"])
+
+    def test_repeated_persistence_of_same_id_is_idempotent(self):
+        backup = self.collect()
+
+        for _ in range(3):
+            neo_health.persist_system_backup_check(
+                backup, db_path=self.db_path
+            )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["verification_id"], backup["verification_id"])
+
+
 if __name__ == "__main__":
     unittest.main()
