@@ -465,24 +465,63 @@ class CollectionValidityTests(unittest.TestCase):
         (status,) = self.last_row(["collection_status"])
         self.assertEqual(status, "ok")
 
-    def test_essential_failure_before_verification_leaves_no_record(self):
+    def test_backup_verification_failure_is_recorded_as_unavailable(self):
+        """Falha de collect_system_backup vira 'unavailable'; a coleta segue."""
         with patch.object(
-            neo_health, "get_memory", side_effect=RuntimeError("sem memória")
+            neo_health,
+            "collect_system_backup",
+            side_effect=RuntimeError("verificação explodiu"),
         ):
-            with contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaises(RuntimeError):
-                    neo_health.main(save=True, db_path=self.db_path)
+            result, output = self.run_collection()
 
-        # Nenhuma verificação artificial: a tabela pode nem existir ainda.
+        self.assertEqual(result, 0)
+
         with sqlite3.connect(self.db_path) as conn:
-            try:
-                count = conn.execute(
-                    "SELECT COUNT(*) FROM system_backup_checks"
-                ).fetchone()[0]
-            except sqlite3.OperationalError:
-                count = 0
+            rows = conn.execute(
+                "SELECT status, reason FROM system_backup_checks"
+            ).fetchall()
 
-        self.assertEqual(count, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "unavailable")
+        self.assertIn("verificação do backup falhou", rows[0][1])
+
+    def test_essential_failure_after_backup_verification_still_records_it(self):
+        """A verificação do backup roda ANTES da coleta essencial.
+
+        Mesmo quando `get_memory` provoca uma exceção que interrompe a
+        coleta, a verificação do backup já foi persistida em
+        `system_backup_checks` (registro efetivo, não apenas a chamada).
+        """
+        backup = {
+            "verification_id": "ver-e8-1",
+            "timestamp": "2026-11-04T07:30:00",
+            "status": "failed",
+            "artifact": "neo-system-2026-11-04.tar.gz",
+            "size_bytes": 123,
+            "age_hours": 1.0,
+            "gzip_ok": 1,
+            "sha256_ok": 0,
+            "sha256": "abc",
+            "reason": "SHA-256 divergente",
+        }
+
+        with patch.object(
+            neo_health, "collect_system_backup", return_value=backup
+        ):
+            with patch.object(
+                neo_health, "get_memory", side_effect=RuntimeError("sem memória")
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(RuntimeError):
+                        neo_health.main(save=True, db_path=self.db_path)
+
+        # A verificação foi PERSISTIDA apesar da falha da coleta essencial.
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT verification_id, status FROM system_backup_checks"
+            ).fetchall()
+
+        self.assertEqual(rows, [("ver-e8-1", "failed")])
 
 
 class MissingComponentsPresentationTests(unittest.TestCase):

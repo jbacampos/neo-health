@@ -1926,6 +1926,53 @@ def main(save=False, db_path=None):
     print("=" * 60)
 
     # --------------------------------------------------------
+    # BACKUP DO SISTEMA
+    #
+    # Verificação independente do artefato produzido pelo workflow
+    # imediatamente antes desta coleta. Executada ANTES da coleta
+    # essencial: uma falha posterior na coleta não impede o registro da
+    # verificação. Não altera collection_status nem missing_components:
+    # falha de backup é achado, não falha de coleta, e nada aqui
+    # interrompe a coleta essencial.
+    # --------------------------------------------------------
+
+    section("BACKUP DO SISTEMA")
+
+    try:
+        system_backup = collect_system_backup()
+    except Exception as error:  # nunca interrompe a coleta essencial
+        system_backup = {
+            "verification_id": new_verification_id(),
+            "timestamp": datetime.now().isoformat(),
+            "status": "unavailable",
+            "artifact": None,
+            "size_bytes": None,
+            "age_hours": None,
+            "gzip_ok": None,
+            "sha256_ok": None,
+            "sha256": None,
+            "reason": sanitize_backup_reason(
+                f"verificação do backup falhou: {type(error).__name__}"
+            ),
+        }
+
+    print_system_backup(system_backup)
+
+    # Persistência INDEPENDENTE, imediatamente após a verificação e antes
+    # de finalize_collection: a verificação é preservada mesmo quando a
+    # coleta essencial falhar depois. Falha aqui é registrada e nunca
+    # interrompe o workflow nem mascara o erro original da coleta.
+    if save:
+        try:
+            persist_system_backup_check(system_backup, db_path=db_path)
+        except Exception as error:
+            print(
+                "Falha ao persistir a verificação do backup do sistema: "
+                f"{error}",
+                file=sys.stderr,
+            )
+
+    # --------------------------------------------------------
     # SISTEMA
     # --------------------------------------------------------
 
@@ -2224,51 +2271,6 @@ def main(save=False, db_path=None):
 
             else:
                 ok("Atualidade", "backup recente")
-
-    # --------------------------------------------------------
-    # BACKUP DO SISTEMA
-    #
-    # Verificação independente do artefato produzido pelo workflow
-    # imediatamente antes desta coleta. Não altera collection_status
-    # nem missing_components: falha de backup é achado, não falha de
-    # coleta, e nada aqui interrompe a coleta essencial.
-    # --------------------------------------------------------
-
-    section("BACKUP DO SISTEMA")
-
-    try:
-        system_backup = collect_system_backup()
-    except Exception as error:  # nunca interrompe a coleta essencial
-        system_backup = {
-            "verification_id": new_verification_id(),
-            "timestamp": datetime.now().isoformat(),
-            "status": "unavailable",
-            "artifact": None,
-            "size_bytes": None,
-            "age_hours": None,
-            "gzip_ok": None,
-            "sha256_ok": None,
-            "sha256": None,
-            "reason": sanitize_backup_reason(
-                f"verificação do backup falhou: {type(error).__name__}"
-            ),
-        }
-
-    print_system_backup(system_backup)
-
-    # Persistência INDEPENDENTE, imediatamente após a verificação e antes
-    # de finalize_collection: a verificação é preservada mesmo quando a
-    # coleta essencial falhar depois. Falha aqui é registrada e nunca
-    # interrompe o workflow nem mascara o erro original da coleta.
-    if save:
-        try:
-            persist_system_backup_check(system_backup, db_path=db_path)
-        except Exception as error:
-            print(
-                "Falha ao persistir a verificação do backup do sistema: "
-                f"{error}",
-                file=sys.stderr,
-            )
 
     # --------------------------------------------------------
     # BACKUP TIMER
