@@ -1537,6 +1537,29 @@ def new_verification_id():
     return str(uuid.uuid4())
 
 
+def _linked_health_id(conn, health_id):
+    """Devolve `health_id` somente se a coleta correspondente existir.
+
+    Guard de integridade referencial (E3, Alternativa C): não há FK física
+    entre `system_backup_checks.health_id` e `health.id`, então o vínculo é
+    validado na aplicação antes de gravar. `health_id` é opcional e NULL é
+    um estado legítimo (verificação independente quando a coleta essencial
+    falha). Um valor informado que não exista em `health` seria uma
+    referência órfã — e o resumo semanal a descartaria silenciosamente como
+    "não verificada". Para nunca gravar referência inexistente e preservar
+    a verificação, o vínculo inválido é descartado (NULL), espelhando o
+    comportamento de `ON DELETE SET NULL`.
+    """
+    if health_id is None:
+        return None
+
+    row = conn.execute(
+        "SELECT 1 FROM health WHERE id = ?", (health_id,)
+    ).fetchone()
+
+    return health_id if row is not None else None
+
+
 def _upsert_system_backup_check(
     conn, verification_id, timestamp, backup, health_id=None
 ):
@@ -1547,7 +1570,12 @@ def _upsert_system_backup_check(
     nunca é apagado por uma gravação posterior sem vínculo — a verificação
     independente (coleta essencial malsucedida) permanece com
     `health_id` NULL até existir uma coleta correspondente.
+
+    O vínculo passa por `_linked_health_id` (E3): uma referência a coleta
+    inexistente é descartada (NULL) e nunca gravada como órfã.
     """
+    health_id = _linked_health_id(conn, health_id)
+
     conn.execute(
         f"""
         INSERT INTO {SYSTEM_BACKUP_CHECKS_TABLE} (

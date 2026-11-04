@@ -1507,6 +1507,19 @@ class SystemBackupChecksPersistenceTests(unittest.TestCase):
                 return []
         return [dict(row) for row in rows]
 
+    def orphans(self):
+        """Referências de `system_backup_checks` sem coleta em `health`."""
+
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                return conn.execute(
+                    "SELECT COUNT(*) FROM system_backup_checks "
+                    "WHERE health_id IS NOT NULL "
+                    "AND health_id NOT IN (SELECT id FROM health)"
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                return 0
+
     def verify(self, **overrides):
         """Resultado de verificação controlado (volume não montado)."""
         backup = neo_health.collect_system_backup(
@@ -1585,6 +1598,74 @@ class SystemBackupChecksPersistenceTests(unittest.TestCase):
         self.assertNotEqual(
             rows[0]["verification_id"], rows[1]["verification_id"]
         )
+
+    # ---------------------------------------------------------
+    # Integridade referencial (E3)
+    # ---------------------------------------------------------
+
+    def test_existing_health_id_is_linked(self):
+        backup = self.verify(status="ok")
+
+        with sqlite3.connect(self.db_path) as conn:
+            neo_health.initialize_health_schema(conn)
+            cursor = conn.execute(
+                "INSERT INTO health (timestamp) VALUES ('2026-11-01T07:30:00')"
+            )
+            health_id = cursor.lastrowid
+
+        neo_health.persist_system_backup_check(
+            backup, health_id=health_id, db_path=self.db_path,
+        )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["health_id"], health_id)
+        self.assertEqual(self.orphans(), 0)
+
+    def test_nonexistent_health_id_is_not_linked(self):
+        """Referência inexistente não vira órfã: a verificação é preservada."""
+
+        backup = self.verify(status="ok")
+
+        neo_health.persist_system_backup_check(
+            backup, health_id=999999, db_path=self.db_path,
+        )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["health_id"])
+        self.assertEqual(self.orphans(), 0)
+
+    def test_invalid_link_does_not_erase_an_existing_valid_link(self):
+        backup = self.verify(status="ok")
+
+        with sqlite3.connect(self.db_path) as conn:
+            neo_health.initialize_health_schema(conn)
+            cursor = conn.execute(
+                "INSERT INTO health (timestamp) VALUES ('2026-11-01T07:30:00')"
+            )
+            health_id = cursor.lastrowid
+
+        neo_health.persist_system_backup_check(
+            backup, health_id=health_id, db_path=self.db_path,
+        )
+        neo_health.persist_system_backup_check(
+            backup, health_id=999999, db_path=self.db_path,
+        )
+
+        rows = self.checks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["health_id"], health_id)
+        self.assertEqual(self.orphans(), 0)
+
+    def test_no_orphans_after_normal_persistence(self):
+        for index in range(3):
+            neo_health.persist_system_backup_check(
+                self.verify(status="ok", artifact=f"neo-system_{index}.tar.gz"),
+                db_path=self.db_path,
+            )
+
+        self.assertEqual(self.orphans(), 0)
 
     # ---------------------------------------------------------
     # Associação com a coleta
