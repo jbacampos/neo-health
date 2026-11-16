@@ -155,6 +155,7 @@ SYSTEM_BACKUP_REQUIRED_MEMBERS = (
     "opt/neo-health/health.db",
     "opt/neo-analysis/notification_state.db",
     "home/jc/thingsboard/docker-compose.yml",
+    "var/lib/mailtrack/db/mailtrack.sqlite3",
     "etc/systemd/system/neo-analysis.service",
     "etc/fstab",
 )

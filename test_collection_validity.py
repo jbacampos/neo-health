@@ -995,6 +995,43 @@ class SystemBackupTests(unittest.TestCase):
         self.assertNotIn("opt/neo-analysis", backup["reason"])
         self.assertTrue(os.path.isfile(path))
 
+    def test_backup_without_mailtrack_database_fails(self):
+        """Sem o banco do MailTrack o conteúdo essencial está incompleto."""
+        members = tuple(
+            member
+            for member in self.MEMBERS
+            if member != "var/lib/mailtrack/db/mailtrack.sqlite3"
+        )
+
+        self.complete_backup(members=members)
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+        self.assertEqual(backup["gzip_ok"], 1)
+        self.assertEqual(backup["sha256_ok"], 1)
+        self.assertIn("mailtrack.sqlite3", backup["reason"])
+        # A mensagem identifica o componente sem expor a árvore.
+        self.assertNotIn("var/lib/mailtrack", backup["reason"])
+
+    def test_reason_keeps_every_missing_member_name(self):
+        """Com todos os membros ausentes, nenhum nome é truncado."""
+        self.complete_backup(members=())
+
+        backup = neo_health.collect_system_backup(self.backup_dir)
+
+        self.assertEqual(backup["status"], "failed")
+
+        for member in self.MEMBERS:
+            self.assertIn(
+                neo_health.backup_path_basename(member), backup["reason"]
+            )
+
+        self.assertNotIn("…", backup["reason"])
+        self.assertLessEqual(
+            len(backup["reason"]), neo_health.MAX_BACKUP_REASON_LENGTH
+        )
+
     def test_prefixed_members_are_accepted(self):
         path = self.complete_backup(
             members=tuple(f"./{member}" for member in self.MEMBERS),
